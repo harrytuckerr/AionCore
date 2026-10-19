@@ -1594,7 +1594,7 @@ fn read_stdin_payload(command: &str, input: &JsonInputArgs) -> Result<Value, Con
         }
         mapped
     })?;
-    if document.value.as_object().is_some_and(Map::is_empty) {
+    if document.metadata.bytes_read == 0 {
         let mut missing = ConfigError::new(ConfigErrorCode::PayloadMissing, command, "JSON payload is required");
         for (key, value) in document.metadata.fields() {
             missing = missing.field(key, value);
@@ -1869,6 +1869,31 @@ fn escape_stderr_field(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_empty_object_is_a_valid_config_payload() {
+        let input = JsonInputArgs {
+            json: Some("{}".to_owned()),
+            input: None,
+        };
+
+        let payload = read_stdin_payload("config settings patch", &input).unwrap();
+
+        assert_eq!(payload, json!({}));
+    }
+
+    #[test]
+    fn zero_byte_config_payload_is_missing() {
+        let input = JsonInputArgs {
+            json: Some(String::new()),
+            input: None,
+        };
+
+        let error = read_stdin_payload("config settings patch", &input).unwrap_err();
+
+        assert_eq!(error.code, ConfigErrorCode::PayloadMissing);
+        assert_eq!(error.fields.get("bytes_read").map(String::as_str), Some("0"));
+    }
 
     #[test]
     fn config_error_renders_quoted_stable_contract() {
