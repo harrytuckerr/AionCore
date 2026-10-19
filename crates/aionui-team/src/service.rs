@@ -1258,6 +1258,19 @@ impl TeamSessionService {
             });
         }
 
+        // Take the exclusive routing barrier after the coordinator hold is
+        // secured and hold it through the initial mailbox preparation, the
+        // roster/conversation role commit, the live role swap, and the hold
+        // release (success or compensation). This guarantees no lead-directed
+        // writer is in flight when the live roles change, so no late row can
+        // land on or wake the demoted lead; mail that arrived before this point
+        // is moved by the handoff's own preparation. Lock order stays
+        // membership (`add_agent_locks`) -> routing barrier.
+        let _routing_guard = match &session {
+            Some(session) => Some(session.scheduler().lead_routing_write().await),
+            None => None,
+        };
+
         // From here every failure compensates the roster so a retry starts from
         // the previous lead instead of a half-applied swap (the "already lead"
         // branch above would otherwise mask it).
@@ -1281,6 +1294,10 @@ impl TeamSessionService {
             // be woken, and its handoff notice is settled read.
             session.end_lead_transfer_hold(&hold_slots, std::slice::from_ref(&target.slot_id));
         }
+        // The live swap and hold release are complete; release the routing
+        // barrier before building the response so writers are not blocked on
+        // an unrelated read.
+        drop(_routing_guard);
 
         info!(
             team_id,
