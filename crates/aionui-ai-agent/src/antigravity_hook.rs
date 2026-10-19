@@ -10,16 +10,12 @@
 //! `\\?\`-verbatim-path fix #4095). Windows runtime is not exercised by our
 //! tests. The wrapper holds the command line that actually runs.
 //!
-//! Two known edges, deliberately not solved here:
-//! - Team members share the team workspace, so they share this one
-//!   `hooks.json`: a mode switch by any member installs or removes the gate for
-//!   all of them (`aionui-session`'s `sync_permission_hook`). agy merges
-//!   multiple NAMED hooks (verified: hooks.md, "File Format"), so
-//!   per-conversation hook names are the eventual way out if that ever bites.
-//! - That same `sync_permission_hook` rewrites only `hooks.json`, never the
-//!   wrapper. On Windows, a session BUILT in full auto has no wrapper on disk;
-//!   switching it out of full auto would restore a `hooks.json` pointing at a
-//!   file that is not there. Integration owns the mode-switch path.
+//! One known edge, deliberately not solved here: team members share the team
+//! workspace, so they share this one `hooks.json` — a mode switch by any member
+//! installs or removes the gate for all of them (`aionui-session`'s
+//! `sync_permission_hook`, which syncs the Windows wrapper alongside the JSON).
+//! agy merges multiple NAMED hooks (verified: hooks.md, "File Format"), so
+//! per-conversation hook names are the eventual way out if that ever bites.
 
 use std::collections::HashMap;
 use std::path::Path;

@@ -43,11 +43,12 @@ impl AntigravityHookConfig {
     /// File name of the Windows wrapper `hooks.json` points at instead of the
     /// binary directly.
     ///
-    /// Shared contract: `aionui-ai-agent` writes it, and the session layer
-    /// restores/removes it on a mode switch, so both must agree on the name
-    /// without the session layer depending on the agent crate. Off Windows
-    /// there is no wrapper — agy runs the quoted binary itself.
-    pub const WINDOWS_WRAPPER_FILE_NAME: &'static str = "aionui-permission-hook.cmd";
+    /// The value lives in `aionui-common` so `aionui-session`'s mode-switch
+    /// sync can name the file too (that crate depends only on `aionui-common`
+    /// and `aionui-process` by design); this associated constant is the hook
+    /// contract's spelling of it. Off Windows there is no wrapper — agy runs
+    /// the quoted binary itself.
+    pub const WINDOWS_WRAPPER_FILE_NAME: &'static str = aionui_common::constants::ANTIGRAVITY_WINDOWS_WRAPPER_FILE_NAME;
 
     /// How long the hook process waits for AionUi to answer before it denies.
     ///

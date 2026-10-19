@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use aionui_common::CommandSpec;
+use aionui_common::constants::ANTIGRAVITY_WINDOWS_WRAPPER_FILE_NAME;
 use aionui_process::Spawner;
 use futures_util::stream::BoxStream;
 use tokio::sync::{Mutex, broadcast, oneshot};
@@ -604,12 +605,21 @@ impl AntigravitySessionBackend {
     /// Removal alone would be unsafe in reverse: with no `hooks.json` agy never
     /// calls back, so switching OUT of full auto has to put the file back or the
     /// session keeps running unattended behind a UI that says otherwise.
+    ///
+    /// A non-full-auto install is TWO files on Windows: `hooks.json` names the
+    /// wrapper, and the wrapper runs the binary (agy executes handlers through
+    /// `cmd /c`, which mangles a quoted absolute path — verified: the installed
+    /// `agy-customizations/docs/hooks.md`, "Hook Handler Fields"). The wrapper
+    /// is written BEFORE `hooks.json`, so a failed restore never publishes a
+    /// `hooks.json` that points at a file which is not on disk. Off Windows the
+    /// prepared wrapper is `None` and only `hooks.json` is managed.
     fn sync_permission_hook(&self) {
         let Some(cwd) = self.config.cwd.as_deref() else {
             return;
         };
         let dir = std::path::Path::new(cwd).join(".agents");
         let path = dir.join("hooks.json");
+        let wrapper_path = dir.join(ANTIGRAVITY_WINDOWS_WRAPPER_FILE_NAME);
         if self.is_full_auto() {
             match std::fs::remove_file(&path) {
                 Ok(()) => {
@@ -618,6 +628,17 @@ impl AntigravitySessionBackend {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
                     tracing::warn!(session_id = %self.session_id, error = %e, "antigravity: could not remove the approval hook")
+                }
+            }
+            // The wrapper belongs to the same install; leaving it behind would
+            // keep a stale reference to this binary in the workspace.
+            match std::fs::remove_file(&wrapper_path) {
+                Ok(()) => {
+                    tracing::info!(session_id = %self.session_id, "antigravity: full auto — hook wrapper removed")
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(session_id = %self.session_id, error = %e, "antigravity: could not remove the hook wrapper")
                 }
             }
             return;
@@ -631,6 +652,19 @@ impl AntigravitySessionBackend {
             );
             return;
         };
+        // Wrapper first: `hooks.json` must never name a file that failed to be
+        // written. A failure here aborts the restore instead of publishing the
+        // JSON alone.
+        if let Some(wrapper) = self.config.permission_hook_wrapper.as_deref()
+            && let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&wrapper_path, wrapper))
+        {
+            tracing::warn!(
+                session_id = %self.session_id,
+                error = %e,
+                "antigravity: could not restore the hook wrapper; hooks.json left unwritten"
+            );
+            return;
+        }
         if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, body)) {
             tracing::warn!(session_id = %self.session_id, error = %e, "antigravity: could not restore the approval hook");
         } else {
@@ -1550,10 +1584,22 @@ mod tests {
         mode: Option<&str>,
         hook_body: Option<&str>,
     ) -> Arc<AntigravitySessionBackend> {
+        backend_with_hook_files(cwd, mode, hook_body, None)
+    }
+
+    /// A backend carrying the two prepared hook files a non-full-auto build
+    /// installs: the `hooks.json` body and the Windows wrapper's contents.
+    fn backend_with_hook_files(
+        cwd: &std::path::Path,
+        mode: Option<&str>,
+        hook_body: Option<&str>,
+        wrapper: Option<&str>,
+    ) -> Arc<AntigravitySessionBackend> {
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let mut cfg = config(&cwd.to_string_lossy());
         cfg.mode = mode.map(str::to_owned);
         cfg.permission_hook_body = hook_body.map(str::to_owned);
+        cfg.permission_hook_wrapper = wrapper.map(str::to_owned);
         Arc::new(AntigravitySessionBackend {
             session_id: "s1".into(),
             slash_commands: Vec::new(),
@@ -1632,6 +1678,85 @@ mod tests {
         .unwrap();
 
         assert!(!hook.exists(), "full auto must not leave a hook agy would call");
+    }
+
+    /// On Windows the gate is two files; leaving full auto restores both, and
+    /// entering it removes both, so a later restore never finds half an install.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn switching_modes_syncs_the_wrapper_with_hooks_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join(".agents");
+        let hook = agents.join("hooks.json");
+        let wrapper = agents.join(ANTIGRAVITY_WINDOWS_WRAPPER_FILE_NAME);
+        let b = backend_with_hook_files(
+            dir.path(),
+            Some("yolo"),
+            Some("{\"stub\":true}"),
+            Some("wrapper-body\r\n"),
+        );
+
+        b.dispatch(Command::SetMode {
+            mode: "default".to_owned(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&wrapper).unwrap(), "wrapper-body\r\n");
+        assert_eq!(std::fs::read_to_string(&hook).unwrap(), "{\"stub\":true}");
+
+        b.dispatch(Command::SetMode {
+            mode: "yolo".to_owned(),
+        })
+        .await
+        .unwrap();
+        assert!(!hook.exists(), "full auto must not leave a hook agy would call");
+        assert!(!wrapper.exists(), "the wrapper must go with hooks.json");
+    }
+
+    /// Off Windows the factory prepares no wrapper, so leaving full auto must
+    /// install only `hooks.json` and never drop a `.cmd` into the workspace.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn leaving_full_auto_installs_no_wrapper_off_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let hook = dir.path().join(".agents/hooks.json");
+        let wrapper = dir.path().join(".agents").join(ANTIGRAVITY_WINDOWS_WRAPPER_FILE_NAME);
+        let b = backend_with_hook_body(dir.path(), Some("yolo"), Some("{\"stub\":true}"));
+
+        b.dispatch(Command::SetMode {
+            mode: "default".to_owned(),
+        })
+        .await
+        .unwrap();
+
+        assert!(hook.exists(), "leaving full auto must restore the gate");
+        assert!(!wrapper.exists(), "unix installs no wrapper");
+    }
+
+    /// The wrapper is written first, so a failed wrapper write must leave the
+    /// old state untouched instead of publishing a `hooks.json` that names a
+    /// file which is not there.
+    #[tokio::test]
+    async fn a_failed_wrapper_restore_never_publishes_hooks_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join(".agents");
+        let hook = agents.join("hooks.json");
+        let wrapper = agents.join(ANTIGRAVITY_WINDOWS_WRAPPER_FILE_NAME);
+        // A directory at the wrapper path makes the write fail after
+        // `create_dir_all` has already succeeded.
+        std::fs::create_dir_all(&wrapper).unwrap();
+        let b = backend_with_hook_files(dir.path(), Some("yolo"), Some("{\"stub\":true}"), Some("wrapper-body"));
+
+        b.dispatch(Command::SetMode {
+            mode: "default".to_owned(),
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            !hook.exists(),
+            "hooks.json must not be published when its wrapper failed to write"
+        );
     }
 
     /// A session whose turn is running WITH the approval hook installed applies a mode
