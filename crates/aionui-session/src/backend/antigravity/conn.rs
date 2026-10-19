@@ -109,21 +109,18 @@ fn final_turn_text(is_error: bool, result_text: &str, buffered: &str) -> Option<
         .filter(|t| !t.is_empty())
 }
 
-/// Append one `text_delta` to the turn's buffered reply, collapsing the
-/// U+FFFD run agy leaves at the join.
-///
-/// A multi-byte character agy cuts across two deltas arrives as a U+FFFD run —
-/// a suffix on one delta plus a prefix on the next — that together stand for
-/// exactly ONE lost character (measured against agy 1.1.14:
-/// samples/antigravity-cli/1.1.14/print_stream-json_long_chinese_fffd.ndjson,
-/// 49 of 49 splits are a 1+2 or 2+1 suffix/prefix pair, never mid-delta).
-/// The bytes are gone before agy serializes the frame, so the character cannot
-/// be restored — but it can be shown as one U+FFFD instead of three. Only the
-/// join case is touched: a U+FFFD away from a boundary passes through, since
-/// only the buffered fallback of a failed or cancelled turn ever renders this
-/// text (a successful turn is replaced wholesale by `result.response`).
-/// Exit fields safe to log. `None` from `exit_status()` is not "still running"
-/// when wait itself failed, so the state word is separate from the code.
+/// How long to wait, after stdout EOF, for the process watcher to publish an
+/// exit that has not landed yet. Stdout can close before that watch update.
+/// This is not a turn timeout: if it expires the exit is reported as not yet
+/// published, and no code is invented.
+const EXIT_WATCH_FOLLOW_UP: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// `result_status` used when the process ended without a `result` frame.
+const ABSENT_RESULT_STATUS: &str = "absent";
+
+/// Exit fields safe to log. No `TerminalExit` means the watcher has not
+/// published yet — that is `still_running`, not a successful exit. A failed
+/// `wait()` is `wait_errored` and also carries no code.
 fn exit_log_fields(exit: Option<aionui_process::TerminalExit>) -> (Option<i32>, Option<bool>, &'static str) {
     match exit {
         Some(aionui_process::TerminalExit::Exited(status)) => (status.code(), Some(status.success()), "exited"),
@@ -140,38 +137,65 @@ fn synthesized_classification(exit_success: Option<bool>) -> &'static str {
     }
 }
 
-fn log_wire_terminal(session_id: &str, diag: &TerminalDiagnostics, exit: Option<aionui_process::TerminalExit>) {
-    let (exit_code, exit_success, exit_state) = exit_log_fields(exit);
-    tracing::info!(
-        session_id = %session_id,
-        saw_terminal = true,
-        result_status = %diag.status,
-        is_error = diag.is_error,
-        outcome = diag.outcome,
-        failed_steps = diag.failed_steps,
-        exit_code = exit_code,
-        exit_success = exit_success,
-        exit_state = exit_state,
-        classification = "wire_result",
-        "antigravity: turn terminal"
-    );
-    if exit_success == Some(false) && !diag.is_error {
-        tracing::warn!(
-            session_id = %session_id,
-            result_status = %diag.status,
-            exit_code = exit_code,
-            "antigravity: wire result is not an error but the process exited unsuccessfully"
-        );
-    } else if exit_success == Some(true) && diag.is_error {
-        tracing::warn!(
-            session_id = %session_id,
-            result_status = %diag.status,
-            exit_code = exit_code,
-            "antigravity: wire result is an error but the process exited successfully"
-        );
-    }
+/// Wire classification distinguishes an error result from a success result.
+/// It is not a single constant for every `result` frame.
+fn wire_classification(is_error: bool) -> &'static str {
+    if is_error { "wire_error" } else { "wire_success" }
 }
 
+/// Logged at the moment the error `TurnResult` is produced, before stdout EOF.
+/// Exit is intentionally absent: the watcher may not have published it yet.
+fn log_error_result_frame(session_id: &str, diag: Option<&TerminalDiagnostics>) {
+    let (result_status, outcome, failed_steps) = match diag {
+        Some(diag) => (diag.status.as_str(), diag.outcome, diag.failed_steps),
+        None => ("unavailable", "failed", 0),
+    };
+    tracing::warn!(
+        session_id = %session_id,
+        saw_terminal = true,
+        result_status = result_status,
+        is_error = true,
+        outcome = outcome,
+        failed_steps = failed_steps,
+        classification = wire_classification(true),
+        exit_state = "not_observed_yet",
+        "antigravity: error result frame"
+    );
+}
+
+/// Immediate watcher state, then one bounded follow-up if it was not published.
+/// `timed_out` means the follow-up expired with the watcher still silent.
+async fn observe_exit_after_eof(
+    proc: &aionui_process::ManagedProcess,
+) -> (Option<i32>, Option<bool>, &'static str, &'static str) {
+    if proc.terminal_exit().is_some() {
+        let (code, success, state) = exit_log_fields(proc.terminal_exit());
+        return (code, success, state, "already_published");
+    }
+    let follow_up = tokio::time::timeout(EXIT_WATCH_FOLLOW_UP, proc.wait_for_exit()).await;
+    let (code, success, state) = exit_log_fields(proc.terminal_exit());
+    let label = if state == "still_running" {
+        let _ = follow_up;
+        "timed_out"
+    } else {
+        "resolved"
+    };
+    (code, success, state, label)
+}
+
+/// Append one `text_delta` to the turn's buffered reply, collapsing the
+/// U+FFFD run agy leaves at the join.
+///
+/// A multi-byte character agy cuts across two deltas arrives as a U+FFFD run —
+/// a suffix on one delta plus a prefix on the next — that together stand for
+/// exactly ONE lost character (measured against agy 1.1.14:
+/// samples/antigravity-cli/1.1.14/print_stream-json_long_chinese_fffd.ndjson,
+/// 49 of 49 splits are a 1+2 or 2+1 suffix/prefix pair, never mid-delta).
+/// The bytes are gone before agy serializes the frame, so the character cannot
+/// be restored — but it can be shown as one U+FFFD instead of three. Only the
+/// join case is touched: a U+FFFD away from a boundary passes through, since
+/// only the buffered fallback of a failed or cancelled turn ever renders this
+/// text (a successful turn is replaced wholesale by `result.response`).
 fn append_delta(buffered: &mut String, delta: &str) {
     const REPLACEMENT: char = '\u{FFFD}';
     let mut delta = delta;
@@ -799,6 +823,14 @@ impl AntigravitySessionBackend {
                                 ..
                             } => {
                                 saw_terminal = true;
+                                // An error result is diagnosed here, while the
+                                // frame is in hand. Waiting for stdout EOF can
+                                // withhold it if the process keeps stdout open
+                                // after the terminal frame. Exit is not claimed
+                                // yet — the watcher publishes that separately.
+                                if *is_error {
+                                    log_error_result_frame(&session_id, translator.terminal_diagnostics());
+                                }
                                 if let Some(text) = final_turn_text(*is_error, result_text, &buffered_text) {
                                     text_flushed = true;
                                     let _ = event_tx.send(SessionEnvelope {
@@ -857,25 +889,64 @@ impl AntigravitySessionBackend {
                 tracing::debug!(session_id = %session_id, model = %model, "agy turn model confirmed");
             }
 
-            // A result frame already classified the turn. Log that class plus
-            // whatever exit is already known, without waiting and without the
-            // reply. A missing frame still synthesizes from the exit below;
-            // that mapping is unchanged.
+            // Exit observation is separate from the result classification.
+            // Snapshot the watcher immediately, then allow one short follow-up
+            // so a publish that loses the race with stdout EOF is visible.
+            // A timeout leaves the code unset.
             if let Some(diag) = translator.terminal_diagnostics() {
-                log_wire_terminal(&session_id, diag, proc.terminal_exit());
+                let (immediate_code, immediate_success, immediate_state) = exit_log_fields(proc.terminal_exit());
+                let (exit_code, exit_success, exit_state, exit_follow_up) = observe_exit_after_eof(&proc).await;
+                tracing::info!(
+                    session_id = %session_id,
+                    saw_terminal = true,
+                    result_status = %diag.status,
+                    is_error = diag.is_error,
+                    outcome = diag.outcome,
+                    failed_steps = diag.failed_steps,
+                    classification = wire_classification(diag.is_error),
+                    exit_state_immediate = immediate_state,
+                    exit_code_immediate = immediate_code,
+                    exit_success_immediate = immediate_success,
+                    exit_state = exit_state,
+                    exit_code = exit_code,
+                    exit_success = exit_success,
+                    exit_follow_up = exit_follow_up,
+                    "antigravity: turn terminal exit observation"
+                );
+                if exit_state == "exited" && exit_success == Some(false) && !diag.is_error {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        result_status = %diag.status,
+                        exit_code = exit_code,
+                        classification = wire_classification(false),
+                        "antigravity: wire result is not an error but the process exited unsuccessfully"
+                    );
+                } else if exit_state == "exited" && exit_success == Some(true) && diag.is_error {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        result_status = %diag.status,
+                        exit_code = exit_code,
+                        classification = wire_classification(true),
+                        "antigravity: wire result is an error but the process exited successfully"
+                    );
+                }
             }
 
             // A cancelled or crashed run exits without emitting `result`; the
             // FSM still needs a terminal, so synthesize one from the exit.
+            // That wait is the pre-existing synthesis wait, not a new bound.
             if !saw_terminal {
                 let exit = proc.wait_for_exit().await;
                 let exit_success = exit.as_ref().map(|s| s.success());
                 let ok = exit_success.unwrap_or(false);
+                let exit_state = if exit.is_some() { "exited" } else { "wait_errored" };
                 tracing::warn!(
                     session_id = %session_id,
                     saw_terminal = false,
+                    result_status = ABSENT_RESULT_STATUS,
                     exit_code = exit.as_ref().and_then(|s| s.code()),
                     exit_success = exit_success,
+                    exit_state = exit_state,
                     classification = synthesized_classification(exit_success),
                     "antigravity: no result frame; terminal synthesized from process exit"
                 );
@@ -1235,6 +1306,9 @@ mod tests {
         // No status is the same class as a failed exit: the synthesizer treats
         // `unwrap_or(false)` as failure and this label must not say otherwise.
         assert_eq!(super::synthesized_classification(None), "synthesized_exit_failure");
+        assert_eq!(super::wire_classification(false), "wire_success");
+        assert_eq!(super::wire_classification(true), "wire_error");
+        assert_eq!(super::ABSENT_RESULT_STATUS, "absent");
     }
 
     fn send(text: &str) -> Command {
