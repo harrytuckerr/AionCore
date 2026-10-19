@@ -258,7 +258,7 @@ pub fn antigravity_capabilities() -> Capabilities {
 /// agy's captured `--mode` values plus AionUi's host-side modes. The 1.4.2
 /// help lists `accept-edits`, `auto`, and `plan` (verified:
 /// `~/aion/protocols/samples/agy/1.4.2/root-probe-help.txt:14`, sha256
-/// `a12355e8fc064b330eeb25ba52de596406582752442e293083bcda6388a63b78`). Account
+/// `a12355e8fc064b330eeb25ba52de596406582752442e293083bcda6388a63b78`).
 /// Help syntax does not prove account availability: the captured account
 /// reported `auto` unavailable and continued in default mode (verified:
 /// `~/aion/protocols/samples/agy/1.4.2/print_stream-json_mode-auto.stderr.txt:1`,
@@ -276,7 +276,7 @@ pub fn antigravity_modes() -> Vec<ModeInfo> {
             "Accept Edits",
             Some("File edits are auto-approved; commands still ask."),
         ),
-        ("auto", "Auto", Some("The captured account could not use this mode.")),
+        ("auto", "Auto", Some("Availability depends on your account.")),
         ("plan", "Plan", Some("Research and plan only.")),
         (
             "yolo",
