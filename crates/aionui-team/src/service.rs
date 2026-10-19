@@ -38,6 +38,7 @@ use crate::event_loop::{AgentLoopContext, EventLoopRegistrationError};
 use crate::events::{
     TEAM_CREATED_EVENT, TEAM_REMOVED_EVENT, TEAM_RENAMED_EVENT, TEAM_SESSION_STATUS_CHANGED_EVENT, TeamEventEmitter,
 };
+use crate::mailbox::Mailbox;
 use crate::member_runtime::{
     AttachLease, AttachOutcome, AttachWaiter, BeginRemove, MemberRuntimeFailure, MemberRuntimeSnapshot, ReserveAttach,
 };
@@ -56,7 +57,7 @@ use crate::session::{
     spawn_attach_agent_process_bg,
 };
 use crate::team_run::TeamRunManager;
-use crate::types::{Team, TeamAgent, TeamTask, TeammateRole};
+use crate::types::{MailboxMessageType, Team, TeamAgent, TeamTask, TeammateRole};
 use crate::work_coordinator::{
     McpRefreshDisposition, ObserveMessagesResult, RuntimeConstraint, RuntimeRestartRejection,
 };
@@ -1341,9 +1342,45 @@ impl TeamSessionService {
         // Fallible mail preparation happens while the caller can still roll the
         // roster back; the live swap that follows is in-memory and cannot fail,
         // so no partial live state can outlive a failed request.
-        if let Some(session) = session {
-            let preparation = session.prepare_lead_handoff(old_lead, new_lead).await?;
-            session.commit_lead_handoff(old_lead, new_lead, &preparation).await;
+        match session {
+            Some(session) => {
+                let preparation = session.prepare_lead_handoff(old_lead, new_lead).await?;
+                session.commit_lead_handoff(old_lead, new_lead, &preparation).await;
+            }
+            None => {
+                // A stopped team still gets the durable mail handoff: the next
+                // ensure_session must find the pending work on the new lead, and
+                // no runtime is started here.
+                let mailbox = Mailbox::new_for_user(self.repo.clone(), user_id.to_owned());
+                let member_slots = team.agents.iter().map(|agent| agent.slot_id.clone()).collect();
+                mailbox
+                    .apply_lead_handoff_mail(team_id, &member_slots, old_lead, new_lead)
+                    .await?;
+                let (new_content, old_content) = crate::session::lead_handoff_notice_contents(new_lead);
+                let _new_notice = mailbox
+                    .write(
+                        team_id,
+                        &new_lead.slot_id,
+                        "team_system",
+                        MailboxMessageType::Message,
+                        &new_content,
+                        None,
+                    )
+                    .await?;
+                let old_notice = mailbox
+                    .write(
+                        team_id,
+                        &old_lead.slot_id,
+                        "team_system",
+                        MailboxMessageType::Message,
+                        &old_content,
+                        None,
+                    )
+                    .await?;
+                mailbox
+                    .mark_read_batch(team_id, std::slice::from_ref(&old_notice.id))
+                    .await?;
+            }
         }
         Ok(())
     }
@@ -5206,6 +5243,72 @@ mod tests {
         svc.remove_agent("user-test", &created.id, &old_lead.slot_id)
             .await
             .expect("the demoted lead must be removable");
+    }
+
+    #[tokio::test]
+    async fn set_team_lead_hands_mail_over_without_a_live_session() {
+        let (svc, repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Lead Transfer"))
+            .await
+            .unwrap();
+        let old_lead = created
+            .assistants
+            .iter()
+            .find(|agent| agent.role == "lead")
+            .expect("lead")
+            .clone();
+        let added = svc
+            .add_agent(
+                "user-test",
+                &created.id,
+                AddAgentRequest {
+                    name: "Promoted".to_owned(),
+                    role: "teammate".to_owned(),
+                    backend: Some("acp".to_owned()),
+                    model: "claude".to_owned(),
+                    assistant_id: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // No session is running: the handoff must still be durable.
+        let mailbox = crate::mailbox::Mailbox::new_for_user(repo.clone(), "user-test");
+        mailbox
+            .write(
+                &created.id,
+                &old_lead.slot_id,
+                "user",
+                MailboxMessageType::Message,
+                "pending for the lead",
+                None,
+            )
+            .await
+            .unwrap();
+
+        svc.set_team_lead("user-test", &created.id, &added.slot_id)
+            .await
+            .unwrap();
+
+        let new_unread = mailbox.peek_unread(&created.id, &added.slot_id).await.unwrap();
+        let contents: Vec<&str> = new_unread.iter().map(|message| message.content.as_str()).collect();
+        assert!(
+            contents.contains(&"pending for the lead"),
+            "the next ensure must find the pending mail on the new lead: {contents:?}"
+        );
+        assert!(
+            contents
+                .iter()
+                .any(|content| content.contains("You are now the team lead")),
+            "the new lead must find its role notice: {contents:?}"
+        );
+
+        let old_unread = mailbox.peek_unread(&created.id, &old_lead.slot_id).await.unwrap();
+        assert!(
+            old_unread.is_empty(),
+            "the demoted lead must have no unread mail: {old_unread:?}"
+        );
     }
 
     #[tokio::test]

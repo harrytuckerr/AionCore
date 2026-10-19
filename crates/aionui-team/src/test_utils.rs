@@ -157,22 +157,28 @@ impl ITeamRepository for MockTeamRepo {
         Ok(())
     }
 
-    async fn retarget_mailbox_ids(
+    async fn apply_lead_handoff_mail(
         &self,
         _user_id: &str,
         team_id: &str,
-        ids: &[String],
+        reroute_ids: &[String],
         to_agent_id: &str,
-    ) -> Result<u64, DbError> {
+        inserts: &[MailboxMessageRow],
+        settle_ids: &[String],
+    ) -> Result<(), DbError> {
         let mut state = self.state.lock().unwrap();
-        let mut moved = 0u64;
         for msg in &mut state.messages {
-            if msg.team_id == team_id && ids.contains(&msg.id) {
+            if msg.team_id == team_id && reroute_ids.contains(&msg.id) {
                 msg.to_agent_id = to_agent_id.to_owned();
-                moved += 1;
             }
         }
-        Ok(moved)
+        state.messages.extend(inserts.iter().cloned());
+        for msg in &mut state.messages {
+            if msg.team_id == team_id && settle_ids.contains(&msg.id) {
+                msg.read = true;
+            }
+        }
+        Ok(())
     }
 
     async fn get_history(
@@ -786,21 +792,28 @@ pub(crate) mod workspace_harness {
             Ok(())
         }
 
-        async fn retarget_mailbox_ids(
+        async fn apply_lead_handoff_mail(
             &self,
             _user_id: &str,
             team_id: &str,
-            ids: &[String],
+            reroute_ids: &[String],
             to_agent_id: &str,
-        ) -> Result<u64, DbError> {
-            let mut moved = 0u64;
-            for message in self.messages.lock().unwrap().iter_mut() {
-                if message.team_id == team_id && ids.contains(&message.id) {
+            inserts: &[aionui_db::models::MailboxMessageRow],
+            settle_ids: &[String],
+        ) -> Result<(), DbError> {
+            let mut messages = self.messages.lock().unwrap();
+            for message in messages.iter_mut() {
+                if message.team_id == team_id && reroute_ids.contains(&message.id) {
                     message.to_agent_id = to_agent_id.to_owned();
-                    moved += 1;
                 }
             }
-            Ok(moved)
+            messages.extend(inserts.iter().cloned());
+            for message in messages.iter_mut() {
+                if message.team_id == team_id && settle_ids.contains(&message.id) {
+                    message.read = true;
+                }
+            }
+            Ok(())
         }
 
         async fn get_history(

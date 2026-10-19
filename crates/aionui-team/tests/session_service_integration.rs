@@ -1047,15 +1047,17 @@ impl ITeamRepository for FullMockTeamRepo {
     async fn mark_read_batch(&self, user_id: &str, team_id: &str, ids: &[String]) -> Result<(), DbError> {
         self.inner.mark_read_batch(user_id, team_id, ids).await
     }
-    async fn retarget_mailbox_ids(
+    async fn apply_lead_handoff_mail(
         &self,
         user_id: &str,
         team_id: &str,
-        ids: &[String],
+        reroute_ids: &[String],
         to_agent_id: &str,
-    ) -> Result<u64, DbError> {
+        inserts: &[aionui_db::models::MailboxMessageRow],
+        settle_ids: &[String],
+    ) -> Result<(), DbError> {
         self.inner
-            .retarget_mailbox_ids(user_id, team_id, ids, to_agent_id)
+            .apply_lead_handoff_mail(user_id, team_id, reroute_ids, to_agent_id, inserts, settle_ids)
             .await
     }
     async fn get_history(

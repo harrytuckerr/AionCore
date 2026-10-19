@@ -17,7 +17,7 @@ use tracing::{info, warn};
 use crate::error::TeamError;
 use crate::event_loop::EventLoopRegistry;
 use crate::events::{TEAM_CHILD_TURN_CANCELLED_EVENT, TeamEventEmitter};
-use crate::mailbox::Mailbox;
+use crate::mailbox::{LeadMailHandoff, Mailbox};
 use crate::mcp::{TeamMcpServer, TeamMcpStdioConfig};
 use crate::member_runtime::{
     AttachLease, AttachOutcome, BeginRemove, MemberRuntimeFailure, MemberRuntimeRegistry, MemberRuntimeSnapshot,
@@ -94,27 +94,18 @@ pub struct SpawnAgentRequest {
     pub assistant_id: Option<String>,
 }
 
-/// What [`TeamSession::prepare_lead_handoff`] settled on the way to a lead swap,
-/// carried into [`TeamSession::commit_lead_handoff`] so the new lead is told
-/// about reports that could not be delivered as mailbox rows.
-#[derive(Debug, Default)]
-pub(crate) struct LeadHandoffPreparation {
-    /// Bounded, single-line excerpts of the new lead's own reports that were
-    /// addressed to the previous lead (they cannot be delivered back to their
-    /// author). The original rows keep their author and stay in history.
-    settled_reports: Vec<String>,
-}
-
-/// One bounded, single-line excerpt for the handoff notice. No payload dumps:
-/// the notice names what was filed, not the full body.
-fn bounded_excerpt(content: &str) -> String {
-    const MAX_CHARS: usize = 160;
-    let single_line = content.replace(['\n', '\r'], " ");
-    let mut excerpt: String = single_line.chars().take(MAX_CHARS).collect();
-    if single_line.chars().count() > MAX_CHARS {
-        excerpt.push('…');
-    }
-    excerpt
+/// Role notice texts for a lead handoff, shared by the live-session path and
+/// the stopped-team path so both write the same durable mail.
+pub(crate) fn lead_handoff_notice_contents(new_lead: &TeamAgent) -> (String, String) {
+    let new_content = format!(
+        "You are now the team lead (slot_id={}). Call team_members for the latest roster, then continue the team's work.",
+        new_lead.slot_id
+    );
+    let old_content = format!(
+        "The team lead role was reassigned to '{}' (slot_id={}). You are now a teammate.",
+        new_lead.name, new_lead.slot_id
+    );
+    (new_content, old_content)
 }
 
 pub struct TeamSession {
@@ -1543,16 +1534,17 @@ impl TeamSession {
         }
     }
 
-    /// Fallible preparation for a lead handoff: settle the new lead's own
-    /// reports and move unread lead-directed mail to it, without touching any
-    /// live role. Split from [`Self::commit_lead_handoff`] so every store write
+    /// Fallible preparation for a lead handoff: move unread lead-directed mail,
+    /// forward the new lead's own settled reports, and settle those rows — all
+    /// through one transactional mailbox helper — without touching any live
+    /// role. Split from [`Self::commit_lead_handoff`] so every store write
     /// happens while the caller can still roll the roster back; the live swap
     /// that follows cannot fail.
     pub(crate) async fn prepare_lead_handoff(
         &self,
         old_lead: &TeamAgent,
         new_lead: &TeamAgent,
-    ) -> Result<LeadHandoffPreparation, TeamError> {
+    ) -> Result<LeadMailHandoff, TeamError> {
         let member_slots: std::collections::HashSet<String> = self
             .scheduler
             .list_agents()
@@ -1560,50 +1552,11 @@ impl TeamSession {
             .into_iter()
             .map(|agent| agent.slot_id)
             .collect();
-        let unread = self.mailbox.peek_unread(&self.team.id, &old_lead.slot_id).await?;
-        let mut settled_ids = Vec::new();
-        let mut rerouted_ids = Vec::new();
-        let mut settled_reports = Vec::new();
-        for message in unread {
-            if !matches!(
-                message.msg_type,
-                MailboxMessageType::Message | MailboxMessageType::IdleNotification
-            ) {
-                continue;
-            }
-            if message.from_agent_id == new_lead.slot_id {
-                // The new lead's own rows cannot be delivered back to their
-                // author (both batch preparation and peek filter self-authored
-                // rows), so settle them here. Reports are surfaced through a
-                // bounded handoff notice instead of being silently dropped.
-                settled_ids.push(message.id.clone());
-                if message.msg_type == MailboxMessageType::Message {
-                    settled_reports.push(bounded_excerpt(&message.content));
-                }
-                continue;
-            }
-            // Only user mail and actual teammates are handed over; a system or
-            // control author, or the old lead's own rows, stay with the slot
-            // they addressed.
-            let eligible = message.from_agent_id == "user"
-                || (member_slots.contains(&message.from_agent_id) && message.from_agent_id != old_lead.slot_id);
-            if eligible {
-                rerouted_ids.push(message.id);
-            }
-        }
-        if !settled_ids.is_empty() {
-            self.mailbox.mark_read_batch(&self.team.id, &settled_ids).await?;
-        }
-        // A single statement: if it fails, nothing has moved and the caller can
-        // roll back without restoring mail. In-flight enqueue leases are never
-        // aborted here, so a failed commit cannot mark a row read (see
-        // `commit_persisted_enqueue`).
-        if !rerouted_ids.is_empty() {
-            self.mailbox
-                .retarget_mail(&self.team.id, &rerouted_ids, &new_lead.slot_id)
-                .await?;
-        }
-        Ok(LeadHandoffPreparation { settled_reports })
+        // In-flight enqueue leases are never aborted here, so a failed commit
+        // cannot mark a row read (see `commit_persisted_enqueue`).
+        self.mailbox
+            .apply_lead_handoff_mail(&self.team.id, &member_slots, old_lead, new_lead)
+            .await
     }
 
     /// Apply the in-memory half of a lead handoff.
@@ -1615,7 +1568,7 @@ impl TeamSession {
         &self,
         old_lead: &TeamAgent,
         new_lead: &TeamAgent,
-        preparation: &LeadHandoffPreparation,
+        preparation: &LeadMailHandoff,
     ) {
         // One lock: swapping the two roles separately would expose a two-lead or
         // no-lead roster to unrelated idle routing.
@@ -1627,13 +1580,25 @@ impl TeamSession {
         // The demoted slot's own pause is preserved.
         self.work_coordinator.clear_slot_pause(&new_lead.slot_id);
         // Rows written while the hold was up still target the old lead; move
-        // them now that the swap is real (idempotent).
-        if let Err(error) = self.catch_up_lead_mail(old_lead, new_lead).await {
-            warn!(
+        // them now that the swap is real (idempotent), and project any report
+        // forwarded in this window.
+        match self.catch_up_lead_mail(old_lead, new_lead).await {
+            Ok(handoff) => {
+                if let Some(notice) = &handoff.forward_notice {
+                    self.project_team_system_message(
+                        &new_lead.slot_id,
+                        &new_lead.conversation_id,
+                        &notice.id,
+                        &notice.content,
+                    )
+                    .await;
+                }
+            }
+            Err(error) => warn!(
                 team_id = %self.team.id,
                 error = %error,
                 "lead handoff could not catch up late lead mail"
-            );
+            ),
         }
         if let Err(error) = self
             .resync_slot_after_handoff(&old_lead.slot_id, TeammateRole::Teammate)
@@ -1658,12 +1623,12 @@ impl TeamSession {
             );
         }
 
+        // Role notice texts are shared with the stopped-team path so both write
+        // the same durable mail.
+        let (new_content, old_content) = lead_handoff_notice_contents(new_lead);
+
         // Old lead: projected and settled read, so it is genuinely passive and
         // a demoted, out-of-credits member can never be woken by it.
-        let old_content = format!(
-            "The team lead role was reassigned to '{}' (slot_id={}). You are now a teammate.",
-            new_lead.name, new_lead.slot_id
-        );
         match self
             .write_lead_notice(&old_lead.slot_id, &old_lead.conversation_id, &old_content)
             .await
@@ -1688,37 +1653,19 @@ impl TeamSession {
             ),
         }
 
-        // Reports the new lead filed to the previous lead cannot be delivered
-        // as rows (both batch preparation and peek filter self-authored rows),
-        // so surface them in one bounded notice instead of dropping them. The
-        // original rows keep their author and stay in history.
-        if !preparation.settled_reports.is_empty() {
-            let list = preparation
-                .settled_reports
-                .iter()
-                .map(|excerpt| format!("- {excerpt}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            let content = format!(
-                "Reports you filed to the previous lead during the handoff were settled without action:\n{list}"
-            );
-            if let Err(error) = self
-                .write_lead_notice(&new_lead.slot_id, &new_lead.conversation_id, &content)
-                .await
-            {
-                warn!(
-                    team_id = %self.team.id,
-                    error = %error,
-                    "lead handoff could not write the settled-reports notice"
-                );
-            }
+        // The forwarded notice for the new lead's own settled reports was
+        // written in the same transaction as the mail move; project it here.
+        if let Some(notice) = &preparation.forward_notice {
+            self.project_team_system_message(
+                &new_lead.slot_id,
+                &new_lead.conversation_id,
+                &notice.id,
+                &notice.content,
+            )
+            .await;
         }
 
         // New lead: notice plus the wake that carries the role prompt.
-        let new_content = format!(
-            "You are now the team lead (slot_id={}). Call team_members for the latest roster, then continue the team's work.",
-            new_lead.slot_id
-        );
         match self
             .write_lead_notice(&new_lead.slot_id, &new_lead.conversation_id, &new_content)
             .await
@@ -1749,26 +1696,24 @@ impl TeamSession {
         }
     }
 
-    /// Move lead-directed mail that landed while the transfer hold was up.
-    async fn catch_up_lead_mail(&self, old_lead: &TeamAgent, new_lead: &TeamAgent) -> Result<(), TeamError> {
-        let unread = self.mailbox.peek_unread(&self.team.id, &old_lead.slot_id).await?;
-        let ids = unread
+    /// Move lead-directed mail that landed while the transfer hold was up, and
+    /// forward any report that arrived in that window. Reuses the same
+    /// transactional mailbox helper as the preparation.
+    async fn catch_up_lead_mail(
+        &self,
+        old_lead: &TeamAgent,
+        new_lead: &TeamAgent,
+    ) -> Result<LeadMailHandoff, TeamError> {
+        let member_slots: std::collections::HashSet<String> = self
+            .scheduler
+            .list_agents()
+            .await
             .into_iter()
-            .filter(|message| {
-                matches!(
-                    message.msg_type,
-                    MailboxMessageType::Message | MailboxMessageType::IdleNotification
-                )
-            })
-            .filter(|message| message.from_agent_id != new_lead.slot_id)
-            .map(|message| message.id)
-            .collect::<Vec<_>>();
-        if !ids.is_empty() {
-            self.mailbox
-                .retarget_mail(&self.team.id, &ids, &new_lead.slot_id)
-                .await?;
-        }
-        Ok(())
+            .map(|agent| agent.slot_id)
+            .collect();
+        self.mailbox
+            .apply_lead_handoff_mail(&self.team.id, &member_slots, old_lead, new_lead)
+            .await
     }
 
     async fn write_lead_notice(
@@ -4921,6 +4866,24 @@ mod tests {
         assert_eq!(
             settled_report.from_agent_id, worker,
             "the settled report must keep its original author"
+        );
+
+        // Swapping back must resume the slot being promoted, even though it was
+        // paused before the first handoff.
+        let preparation = session
+            .prepare_lead_handoff(&new_lead, &old_lead)
+            .await
+            .expect("swap-back preparation");
+        session.commit_lead_handoff(&new_lead, &old_lead, &preparation).await;
+        assert_eq!(
+            session.scheduler().find_lead_slot_id().await.as_deref(),
+            Some(lead.as_str()),
+            "the swap-back must restore the original lead"
+        );
+        assert_ne!(
+            session.work_coordinator().slot_snapshot(&lead).unwrap().state,
+            SlotPhase::Paused,
+            "the promoted slot must be resumed on the swap back"
         );
     }
 

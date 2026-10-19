@@ -9,7 +9,7 @@ use tracing::debug;
 use crate::activity_mapping::mailbox_row_to_response;
 use crate::error::TeamError;
 use crate::events::TeamEventEmitter;
-use crate::types::{MailboxMessage, MailboxMessageType};
+use crate::types::{MailboxMessage, MailboxMessageType, TeamAgent};
 
 pub struct Mailbox {
     repo: Arc<dyn ITeamRepository>,
@@ -18,6 +18,27 @@ pub struct Mailbox {
     /// [`Mailbox::new`] directly.
     events: Option<Arc<TeamEventEmitter>>,
     user_id: String,
+}
+
+/// What [`Mailbox::apply_lead_handoff_mail`] forwarded, so the live-session
+/// caller can project it. The stopped-team caller ignores it: the row itself is
+/// already durable.
+pub(crate) struct LeadMailHandoff {
+    /// The attributed notice forwarding the new lead's own settled reports,
+    /// when any had to be settled.
+    pub(crate) forward_notice: Option<MailboxMessage>,
+}
+
+/// One bounded, single-line excerpt for the handoff notice. No payload dumps:
+/// the notice names what was filed, not the full body.
+fn bounded_excerpt(content: &str) -> String {
+    const MAX_CHARS: usize = 160;
+    let single_line = content.replace(['\n', '\r'], " ");
+    let mut excerpt: String = single_line.chars().take(MAX_CHARS).collect();
+    if single_line.chars().count() > MAX_CHARS {
+        excerpt.push('…');
+    }
+    excerpt
 }
 
 impl Mailbox {
@@ -166,17 +187,108 @@ impl Mailbox {
         Ok(())
     }
 
-    /// Re-point the given mailbox rows to another recipient.
+    /// Persistent mail half of a lead handoff, in ONE transaction: move the
+    /// eligible unread lead-directed rows to the new lead, insert the forwarded
+    /// notice for the new lead's own settled reports, and mark those rows read.
     ///
-    /// Used by a lead handoff: ids, read state, and history are preserved, and
-    /// the caller decides which rows are eligible to move.
-    pub async fn retarget_mail(&self, team_id: &str, ids: &[String], to_agent_id: &str) -> Result<u64, TeamError> {
-        let moved = self
-            .repo
-            .retarget_mailbox_ids(&self.user_id, team_id, ids, to_agent_id)
+    /// Shared by the live-session path and the stopped-team path so both apply
+    /// the same algorithm; ids, read state, and history are preserved, and only
+    /// user/current-teammate senders are forwarded. Either all of it lands or
+    /// none of it does, so a retry can never settle a report without its notice.
+    pub(crate) async fn apply_lead_handoff_mail(
+        &self,
+        team_id: &str,
+        member_slots: &std::collections::HashSet<String>,
+        old_lead: &TeamAgent,
+        new_lead: &TeamAgent,
+    ) -> Result<LeadMailHandoff, TeamError> {
+        let unread = self.peek_unread(team_id, &old_lead.slot_id).await?;
+        let mut reroute_ids = Vec::new();
+        let mut settle_ids = Vec::new();
+        let mut settled_reports = Vec::new();
+        for message in unread {
+            if !matches!(
+                message.msg_type,
+                MailboxMessageType::Message | MailboxMessageType::IdleNotification
+            ) {
+                continue;
+            }
+            if message.from_agent_id == new_lead.slot_id {
+                // The new lead's own rows cannot be delivered back to their
+                // author (both batch preparation and peek filter self-authored
+                // rows), so settle them here and forward their content below.
+                settle_ids.push(message.id.clone());
+                if message.msg_type == MailboxMessageType::Message {
+                    settled_reports.push(bounded_excerpt(&message.content));
+                }
+                continue;
+            }
+            // Only user mail and actual teammates are handed over; a system or
+            // control author, or the old lead's own rows, stay with the slot
+            // they addressed.
+            let eligible = message.from_agent_id == "user"
+                || (member_slots.contains(&message.from_agent_id) && message.from_agent_id != old_lead.slot_id);
+            if eligible {
+                reroute_ids.push(message.id);
+            }
+        }
+
+        let forward_notice = if settled_reports.is_empty() {
+            None
+        } else {
+            let list = settled_reports
+                .iter()
+                .map(|excerpt| format!("- {excerpt}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Some(MailboxMessage {
+                id: generate_id(),
+                team_id: team_id.to_owned(),
+                to_agent_id: new_lead.slot_id.clone(),
+                from_agent_id: "team_system".to_owned(),
+                msg_type: MailboxMessageType::Message,
+                content: format!(
+                    "Reports you filed to the previous lead during the handoff were settled without action:\n{list}"
+                ),
+                summary: None,
+                files: None,
+                read: false,
+                created_at: now_ms(),
+            })
+        };
+        let inserts = forward_notice
+            .iter()
+            .map(|notice| MailboxMessageRow {
+                id: notice.id.clone(),
+                team_id: notice.team_id.clone(),
+                to_agent_id: notice.to_agent_id.clone(),
+                from_agent_id: notice.from_agent_id.clone(),
+                msg_type: notice.msg_type.to_string(),
+                content: notice.content.clone(),
+                summary: notice.summary.clone(),
+                files: None,
+                read: notice.read,
+                created_at: notice.created_at,
+            })
+            .collect::<Vec<_>>();
+
+        self.repo
+            .apply_lead_handoff_mail(
+                &self.user_id,
+                team_id,
+                &reroute_ids,
+                &new_lead.slot_id,
+                &inserts,
+                &settle_ids,
+            )
             .await?;
-        debug!(team_id, to_agent_id, moved, "team mailbox retargeted for lead handoff");
-        Ok(moved)
+        debug!(
+            team_id,
+            rerouted = reroute_ids.len(),
+            settled = settle_ids.len(),
+            "team mailbox handoff applied"
+        );
+        Ok(LeadMailHandoff { forward_notice })
     }
 
     /// Runtime-only cancel helper: mark currently unread mailbox rows as read
