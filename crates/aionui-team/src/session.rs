@@ -27,8 +27,8 @@ use crate::message_projection::{
     TeamMessageProjection, TeamProjectionMessageStore, TeamProjectionRequest, TeamProjectionSource, teammate_dedupe_key,
 };
 use crate::ports::{
-    AgentTurnCancellationPort, AgentTurnExecutionPort, NativeSlashCommandPort, NoopNativeSlashCommandPort,
-    SlashCommandRecognition,
+    AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnStatus,
+    NativeSlashCommandPort, NoopNativeSlashCommandPort, SlashCommandRecognition,
 };
 use crate::prompt_dump::{TeamPromptDumpConfig, TeamWakePromptDump, dump_team_wake_prompt};
 use crate::prompts::{build_lead_prompt_for_transport, build_teammate_prompt_for_transport, build_wake_payload};
@@ -84,6 +84,42 @@ pub(crate) enum PrepareBatchResult {
     WaitingForCompletion,
     Blocked,
     Quiescent,
+}
+
+/// Allowlisted delivery failure classes. These are derived from Team turn
+/// control flow, never copied from provider error text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeliveryFailureClassification {
+    TurnStartFailed,
+    TurnStartSkipped,
+    TurnFailed,
+    TurnSkipped,
+}
+
+impl DeliveryFailureClassification {
+    pub(crate) fn from_start_error(error: &AgentTurnExecutionError) -> Self {
+        match error {
+            AgentTurnExecutionError::Failed { .. } => Self::TurnStartFailed,
+            AgentTurnExecutionError::Skipped { .. } => Self::TurnStartSkipped,
+        }
+    }
+
+    pub(crate) fn from_turn_status(status: AgentTurnStatus) -> Option<Self> {
+        match status {
+            AgentTurnStatus::Completed => None,
+            AgentTurnStatus::Failed => Some(Self::TurnFailed),
+            AgentTurnStatus::Skipped => Some(Self::TurnSkipped),
+        }
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::TurnStartFailed => "turn_start_failed",
+            Self::TurnStartSkipped => "turn_start_skipped",
+            Self::TurnFailed => "turn_failed",
+            Self::TurnSkipped => "turn_skipped",
+        }
+    }
 }
 
 /// Input for [`TeamSession::spawn_agent`]. Populated by the lead agent when
@@ -2040,6 +2076,7 @@ impl TeamSession {
         &self,
         slot_id: &str,
         abandoned_count: usize,
+        classification: DeliveryFailureClassification,
     ) -> Result<(), TeamError> {
         let Some(lead_slot_id) = self.scheduler.find_lead_slot_id().await else {
             return Ok(());
@@ -2050,9 +2087,11 @@ impl TeamSession {
         }
         let content = format!(
             "Teammate {slot_id} could not process {abandoned_count} queued message(s) after \
-             {MAX_MESSAGE_DELIVERY_FAILURES} delivery attempts. Those messages were dropped and the \
+             {MAX_MESSAGE_DELIVERY_FAILURES} delivery attempts. Failure classification: {}. \
+             Those messages were dropped and the \
              teammate is now paused: it will not pick up new work until you interrupt it with \
-             team_interrupt_agent or the user intervenes. Check on it before assigning more work."
+             team_interrupt_agent or the user intervenes. Check on it before assigning more work.",
+            classification.as_str()
         );
         self.mailbox
             .write(
@@ -2912,6 +2951,60 @@ mod tests {
         assert_eq!(state.messages[0].to_agent_id, "worker-1");
         assert_eq!(state.messages[0].content, "Do this task");
         session.stop();
+    }
+
+    #[tokio::test]
+    async fn delivery_exhaustion_notice_includes_safe_failure_classification() {
+        let session = start_session().await;
+        let error = AgentTurnExecutionError::Failed {
+            reason: "raw provider detail must not reach the notice".into(),
+        };
+        let classification = DeliveryFailureClassification::from_start_error(&error);
+
+        session
+            .notify_leader_delivery_exhausted("worker-1", 2, classification)
+            .await
+            .unwrap();
+
+        let notices = session.mailbox().peek_unread("t1", "lead-1").await.unwrap();
+        assert_eq!(notices.len(), 1);
+        assert!(
+            notices[0]
+                .content
+                .contains("Failure classification: turn_start_failed.")
+        );
+        assert!(!notices[0].content.contains("raw provider detail"));
+        session.stop();
+    }
+
+    #[test]
+    fn delivery_failure_classification_uses_normalized_port_variants() {
+        assert_eq!(
+            DeliveryFailureClassification::from_turn_status(crate::ports::AgentTurnStatus::Completed),
+            None
+        );
+        assert_eq!(
+            DeliveryFailureClassification::from_turn_status(crate::ports::AgentTurnStatus::Failed),
+            Some(DeliveryFailureClassification::TurnFailed)
+        );
+        assert_eq!(
+            DeliveryFailureClassification::from_turn_status(crate::ports::AgentTurnStatus::Skipped),
+            Some(DeliveryFailureClassification::TurnSkipped)
+        );
+
+        let skipped = AgentTurnExecutionError::Skipped {
+            reason: "untrusted provider reason".into(),
+        };
+        assert_eq!(
+            DeliveryFailureClassification::from_start_error(&skipped),
+            DeliveryFailureClassification::TurnStartSkipped
+        );
+        assert_eq!(
+            DeliveryFailureClassification::from_start_error(&AgentTurnExecutionError::Failed {
+                reason: "untrusted provider reason".into(),
+            }),
+            DeliveryFailureClassification::TurnStartFailed
+        );
     }
 
     #[tokio::test]
