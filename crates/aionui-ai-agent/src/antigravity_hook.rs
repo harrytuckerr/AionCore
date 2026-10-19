@@ -80,14 +80,6 @@ const AGENTS_DIR: &str = ".agents";
 /// Subcommand that turns our own binary into agy's hook process.
 const HOOK_SUBCOMMAND: &str = "antigravity-hook";
 
-/// File name of the Windows wrapper agy executes in place of the raw binary.
-///
-/// agy resolves the handler's `command` against the directory containing
-/// `hooks.json`, which it sets as the handler's working directory (verified:
-/// hooks.md lines 129-133, "Hook Handler Fields"), so the bare name is enough —
-/// nothing for cmd to word-split or de-quote.
-const WINDOWS_WRAPPER_FILE_NAME: &str = "aionui-permission-hook.cmd";
-
 /// Remove the files this module installs. Absence is the success case, so a
 /// missing file is not an error.
 ///
@@ -102,7 +94,10 @@ pub fn remove_hooks_json(workspace: &Path) {
 /// Remove the platform-specific companion file, if this platform installs one.
 #[cfg(windows)]
 fn remove_platform_files(dir: &Path) {
-    remove_file_if_present(&dir.join(WINDOWS_WRAPPER_FILE_NAME), "the hook wrapper");
+    remove_file_if_present(
+        &dir.join(AntigravityHookConfig::WINDOWS_WRAPPER_FILE_NAME),
+        "the hook wrapper",
+    );
 }
 
 /// Off Windows there is no companion file: agy runs the quoted binary itself.
@@ -133,7 +128,10 @@ pub fn write_hooks_json(workspace: &Path, hook_binary: &Path) -> std::io::Result
 
 #[cfg(windows)]
 fn write_platform_files(dir: &Path, hook_binary: &Path) -> std::io::Result<()> {
-    std::fs::write(dir.join(WINDOWS_WRAPPER_FILE_NAME), wrapper_body(hook_binary)?)
+    std::fs::write(
+        dir.join(AntigravityHookConfig::WINDOWS_WRAPPER_FILE_NAME),
+        wrapper_body(hook_binary)?,
+    )
 }
 
 /// Off Windows there is no companion file: agy runs the quoted binary itself.
@@ -158,6 +156,28 @@ fn write_platform_files(_dir: &Path, _hook_binary: &Path) -> std::io::Result<()>
 fn wrapper_body(hook_binary: &Path) -> std::io::Result<String> {
     let exe = dunce::canonicalize(hook_binary)?;
     Ok(format!("@\"{}\" {HOOK_SUBCOMMAND}\r\n", exe.display()))
+}
+
+/// The wrapper's contents, prepared for a later mode switch but NOT written:
+/// `None` off Windows (agy runs the quoted binary directly), `Some(contents)`
+/// on Windows, or an error when the binary cannot be canonicalized.
+///
+/// The factory carries this beside the prepared `hooks.json` body so the
+/// session layer can restore the whole gate when a session leaves full auto —
+/// it knows the workspace, not where AionUi's binary lives, so it cannot
+/// rebuild either file on its own. Falling back to the un-canonicalized path is
+/// deliberately not an option: on Windows that may be the `\\?\` verbatim form
+/// the wrapper exists to keep out (#4095, reporter-observed).
+pub fn prepare_wrapper_body(hook_binary: &Path) -> std::io::Result<Option<String>> {
+    #[cfg(windows)]
+    {
+        Ok(Some(wrapper_body(hook_binary)?))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hook_binary;
+        Ok(None)
+    }
 }
 
 /// The `hooks.json` contents, without writing them.
@@ -204,7 +224,7 @@ fn hook_command(hook_binary: &Path, windows: bool) -> String {
         // reporter-observed reaching cmd literally (#4317), and a `\\?\`
         // verbatim path is reported not to launch (#4095). The wrapper carries
         // the real command line.
-        WINDOWS_WRAPPER_FILE_NAME.to_owned()
+        AntigravityHookConfig::WINDOWS_WRAPPER_FILE_NAME.to_owned()
     } else {
         // A COMMAND LINE, not a bare path: agy word-splits it and honours
         // double quotes (verified against agy 1.1.8, including a path
@@ -320,7 +340,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(
             v[AntigravityHookConfig::HOOK_NAME]["PreToolUse"][0]["hooks"][0]["command"],
-            WINDOWS_WRAPPER_FILE_NAME
+            AntigravityHookConfig::WINDOWS_WRAPPER_FILE_NAME
         );
     }
 
@@ -369,6 +389,43 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
+    #[test]
+    fn wrapper_preparation_is_platform_correct_and_fallible() {
+        // The restore path prepares the wrapper only on the platform that
+        // installs one: Some on Windows, None off it. A binary that cannot be
+        // canonicalized must error on Windows — never a fallback path — and is
+        // irrelevant off it.
+        let dir = tempfile::tempdir().unwrap();
+        let exe = stub_exe(dir.path());
+
+        let prepared = prepare_wrapper_body(&exe).unwrap();
+        assert_eq!(
+            prepared.is_some(),
+            cfg!(windows),
+            "wrapper presence must match the platform"
+        );
+        if let Some(body) = prepared {
+            assert!(
+                body.contains("antigravity-hook"),
+                "wrapper must carry the subcommand: {body}"
+            );
+            assert!(body.starts_with("@\""), "wrapper must silence the command line: {body}");
+        }
+
+        let missing = dir.path().join("does-not-exist.exe");
+        match prepare_wrapper_body(&missing) {
+            Ok(None) => assert!(
+                !cfg!(windows),
+                "windows must not prepare a wrapper for a missing binary"
+            ),
+            Ok(Some(_)) => panic!("a missing binary must never produce a wrapper"),
+            Err(e) => {
+                assert!(cfg!(windows), "only windows canonicalizes: {e}");
+                assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
+            }
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn the_windows_install_writes_a_wrapper_hooks_json_can_launch() {
@@ -378,7 +435,12 @@ mod tests {
 
         write_hooks_json(dir.path(), &exe).unwrap();
 
-        let wrapper = std::fs::read_to_string(dir.path().join(".agents").join(WINDOWS_WRAPPER_FILE_NAME)).unwrap();
+        let wrapper = std::fs::read_to_string(
+            dir.path()
+                .join(".agents")
+                .join(AntigravityHookConfig::WINDOWS_WRAPPER_FILE_NAME),
+        )
+        .unwrap();
         assert_eq!(
             wrapper,
             format!(
@@ -390,7 +452,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(
             v[AntigravityHookConfig::HOOK_NAME]["PreToolUse"][0]["hooks"][0]["command"],
-            WINDOWS_WRAPPER_FILE_NAME
+            AntigravityHookConfig::WINDOWS_WRAPPER_FILE_NAME
         );
     }
 
@@ -404,7 +466,12 @@ mod tests {
         let err = write_hooks_json(dir.path(), &missing).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         assert!(!dir.path().join(".agents/hooks.json").exists());
-        assert!(!dir.path().join(".agents").join(WINDOWS_WRAPPER_FILE_NAME).exists());
+        assert!(
+            !dir.path()
+                .join(".agents")
+                .join(AntigravityHookConfig::WINDOWS_WRAPPER_FILE_NAME)
+                .exists()
+        );
     }
 
     #[test]
@@ -424,7 +491,10 @@ mod tests {
         // approval nobody is there to give, and a workspace must not keep files
         // this module installed.
         let dir = tempfile::tempdir().unwrap();
-        let wrapper = dir.path().join(".agents").join(WINDOWS_WRAPPER_FILE_NAME);
+        let wrapper = dir
+            .path()
+            .join(".agents")
+            .join(AntigravityHookConfig::WINDOWS_WRAPPER_FILE_NAME);
 
         write_hooks_json(dir.path(), &stub_exe(dir.path())).unwrap();
         assert!(dir.path().join(".agents/hooks.json").exists());

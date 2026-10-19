@@ -40,6 +40,15 @@ impl AntigravityHookConfig {
     /// Name under which the bridge registers itself in `hooks.json`.
     pub const HOOK_NAME: &'static str = "aionui-permission-bridge";
 
+    /// File name of the Windows wrapper `hooks.json` points at instead of the
+    /// binary directly.
+    ///
+    /// Shared contract: `aionui-ai-agent` writes it, and the session layer
+    /// restores/removes it on a mode switch, so both must agree on the name
+    /// without the session layer depending on the agent crate. Off Windows
+    /// there is no wrapper — agy runs the quoted binary itself.
+    pub const WINDOWS_WRAPPER_FILE_NAME: &'static str = "aionui-permission-hook.cmd";
+
     /// How long the hook process waits for AionUi to answer before it denies.
     ///
     /// Bounds a wedged backend so a tool call fails closed instead of stalling
