@@ -83,8 +83,6 @@ $teamInputPath = [IO.Path]::GetTempFileName()
 & $env:AIONUI_HELPER_BIN team send-message --input $teamInputPath
 Remove-Item -LiteralPath $teamInputPath
 
-Windows runtime: Not exercised.
-
 Do not guess team_id, slot_id, role, permissions, or internal tokens.
 Do not claim you used MCP tools in CLI transport.
 Use slot_id values from this prompt, team context, or team members results
@@ -133,7 +131,6 @@ mod tests {
         assert!(usage.contains("Windows PowerShell 7.3+ with Standard/Windows native argument mode"));
         assert!(usage.contains("Windows PowerShell 5.1 or Legacy native argument mode"));
         assert!(usage.contains("--input $teamInputPath"));
-        assert!(usage.contains("Windows runtime: Not exercised"));
         assert!(
             usage.contains("learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_parsing")
         );

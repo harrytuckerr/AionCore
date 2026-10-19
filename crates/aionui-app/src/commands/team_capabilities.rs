@@ -34,8 +34,7 @@ pub(crate) fn data() -> Value {
             "overall_read_timeout_ms": 30000
         },
         "execution": {
-            "instruction": "Run Team CLI commands in the foreground; do not background them.",
-            "windows_runtime": "Not exercised"
+            "instruction": "Run Team CLI commands in the foreground; do not background them."
         },
         "examples": [
             {
@@ -123,8 +122,6 @@ Send a message with Windows PowerShell 5.1 or Legacy native argument mode using 
     & $env:AIONUI_HELPER_BIN team send-message --input $teamInputPath
     Remove-Item -LiteralPath $teamInputPath
 
-Windows runtime: Not exercised.
-
 The send-message payload requires to and message (verified: crates/aionui-api-types/src/team_tools.rs).
 
 "##,
@@ -160,7 +157,6 @@ mod tests {
         assert!(help.contains("Windows PowerShell 7.3+ using Standard/Windows native argument mode"));
         assert!(help.contains("Windows PowerShell 5.1 or Legacy native argument mode"));
         assert!(help.contains("--input $teamInputPath"));
-        assert!(help.contains("Windows runtime: Not exercised"));
         assert!(
             help.contains("learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_parsing")
         );
@@ -194,7 +190,6 @@ mod tests {
                 .unwrap()
                 .contains("foreground")
         );
-        assert_eq!(data["execution"]["windows_runtime"], "Not exercised");
         assert_eq!(
             data["examples"][3]["shell"],
             "Windows PowerShell 7.3+ (Standard/Windows native argument mode)"
