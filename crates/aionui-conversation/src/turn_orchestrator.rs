@@ -173,7 +173,7 @@ impl ConversationTurnOrchestrator {
                 return Err(ConversationTurnResult {
                     status: ConversationTurnStatus::Failed,
                     error_message: Some(failure_message),
-                    error_code: Some(top_level_code),
+                    error_code: send_error.code(),
                 });
             }
         };
@@ -210,7 +210,7 @@ impl ConversationTurnOrchestrator {
             return Err(ConversationTurnResult {
                 status: ConversationTurnStatus::Failed,
                 error_message: Some(failure_message),
-                error_code: Some(top_level_code),
+                error_code: send_error.code(),
             });
         }
 
@@ -365,7 +365,7 @@ impl ConversationTurnOrchestrator {
                         return Err(ConversationTurnResult {
                             status: ConversationTurnStatus::Failed,
                             error_message: Some(failure_message),
-                            error_code: Some(top_level_code),
+                            error_code: send_error.code(),
                         });
                     }
                 }

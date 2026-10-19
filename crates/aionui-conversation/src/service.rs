@@ -4143,7 +4143,7 @@ impl ConversationService {
                     turn_id,
                     status: ConversationAgentTurnStatus::Failed,
                     error_message: Some(send_error_display_message(&send_error)),
-                    error_code: Some(top_level_code),
+                    error_code: send_error.code(),
                     runtime: self.runtime_summary_for(&request.conversation_id).await,
                 });
             }
