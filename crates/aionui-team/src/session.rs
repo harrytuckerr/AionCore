@@ -90,10 +90,10 @@ pub(crate) enum PrepareBatchResult {
 /// control flow, never copied from provider error text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DeliveryFailureClassification {
-    TurnStartFailed,
-    TurnStartSkipped,
-    TurnFailed,
-    TurnSkipped,
+    StartFailed,
+    StartSkipped,
+    Failed,
+    Skipped,
 }
 
 fn normalized_error_code_label(error_code: AgentErrorCode) -> Option<String> {
@@ -103,25 +103,25 @@ fn normalized_error_code_label(error_code: AgentErrorCode) -> Option<String> {
 impl DeliveryFailureClassification {
     pub(crate) fn from_start_error(error: &AgentTurnExecutionError) -> Self {
         match error {
-            AgentTurnExecutionError::Failed { .. } => Self::TurnStartFailed,
-            AgentTurnExecutionError::Skipped { .. } => Self::TurnStartSkipped,
+            AgentTurnExecutionError::Failed { .. } => Self::StartFailed,
+            AgentTurnExecutionError::Skipped { .. } => Self::StartSkipped,
         }
     }
 
     pub(crate) fn from_turn_status(status: AgentTurnStatus) -> Option<Self> {
         match status {
             AgentTurnStatus::Completed => None,
-            AgentTurnStatus::Failed => Some(Self::TurnFailed),
-            AgentTurnStatus::Skipped => Some(Self::TurnSkipped),
+            AgentTurnStatus::Failed => Some(Self::Failed),
+            AgentTurnStatus::Skipped => Some(Self::Skipped),
         }
     }
 
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
-            Self::TurnStartFailed => "turn_start_failed",
-            Self::TurnStartSkipped => "turn_start_skipped",
-            Self::TurnFailed => "turn_failed",
-            Self::TurnSkipped => "turn_skipped",
+            Self::StartFailed => "turn_start_failed",
+            Self::StartSkipped => "turn_start_skipped",
+            Self::Failed => "turn_failed",
+            Self::Skipped => "turn_skipped",
         }
     }
 }
@@ -2998,11 +2998,11 @@ mod tests {
         );
         assert_eq!(
             DeliveryFailureClassification::from_turn_status(crate::ports::AgentTurnStatus::Failed),
-            Some(DeliveryFailureClassification::TurnFailed)
+            Some(DeliveryFailureClassification::Failed)
         );
         assert_eq!(
             DeliveryFailureClassification::from_turn_status(crate::ports::AgentTurnStatus::Skipped),
-            Some(DeliveryFailureClassification::TurnSkipped)
+            Some(DeliveryFailureClassification::Skipped)
         );
 
         let skipped = AgentTurnExecutionError::Skipped {
@@ -3010,13 +3010,13 @@ mod tests {
         };
         assert_eq!(
             DeliveryFailureClassification::from_start_error(&skipped),
-            DeliveryFailureClassification::TurnStartSkipped
+            DeliveryFailureClassification::StartSkipped
         );
         assert_eq!(
             DeliveryFailureClassification::from_start_error(&AgentTurnExecutionError::Failed {
                 reason: "untrusted provider reason".into(),
             }),
-            DeliveryFailureClassification::TurnStartFailed
+            DeliveryFailureClassification::StartFailed
         );
     }
 
