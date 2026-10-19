@@ -57,7 +57,7 @@ use crate::session::{
     spawn_attach_agent_process_bg,
 };
 use crate::team_run::TeamRunManager;
-use crate::types::{MailboxMessageType, Team, TeamAgent, TeamTask, TeammateRole};
+use crate::types::{Team, TeamAgent, TeamTask, TeammateRole};
 use crate::work_coordinator::{
     McpRefreshDisposition, ObserveMessagesResult, RuntimeConstraint, RuntimeRestartRejection,
 };
@@ -1348,37 +1348,14 @@ impl TeamSessionService {
                 session.commit_lead_handoff(old_lead, new_lead, &preparation).await;
             }
             None => {
-                // A stopped team still gets the durable mail handoff: the next
-                // ensure_session must find the pending work on the new lead, and
-                // no runtime is started here.
+                // A stopped team still gets the durable mail handoff in one
+                // transaction (mail move, forwarded reports, and both role
+                // notices): the next ensure_session must find the pending work
+                // on the new lead, and no runtime is started here.
                 let mailbox = Mailbox::new_for_user(self.repo.clone(), user_id.to_owned());
                 let member_slots = team.agents.iter().map(|agent| agent.slot_id.clone()).collect();
                 mailbox
-                    .apply_lead_handoff_mail(team_id, &member_slots, old_lead, new_lead)
-                    .await?;
-                let (new_content, old_content) = crate::session::lead_handoff_notice_contents(new_lead);
-                let _new_notice = mailbox
-                    .write(
-                        team_id,
-                        &new_lead.slot_id,
-                        "team_system",
-                        MailboxMessageType::Message,
-                        &new_content,
-                        None,
-                    )
-                    .await?;
-                let old_notice = mailbox
-                    .write(
-                        team_id,
-                        &old_lead.slot_id,
-                        "team_system",
-                        MailboxMessageType::Message,
-                        &old_content,
-                        None,
-                    )
-                    .await?;
-                mailbox
-                    .mark_read_batch(team_id, std::slice::from_ref(&old_notice.id))
+                    .apply_lead_handoff_mail(team_id, &member_slots, old_lead, new_lead, true)
                     .await?;
             }
         }

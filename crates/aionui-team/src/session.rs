@@ -94,20 +94,6 @@ pub struct SpawnAgentRequest {
     pub assistant_id: Option<String>,
 }
 
-/// Role notice texts for a lead handoff, shared by the live-session path and
-/// the stopped-team path so both write the same durable mail.
-pub(crate) fn lead_handoff_notice_contents(new_lead: &TeamAgent) -> (String, String) {
-    let new_content = format!(
-        "You are now the team lead (slot_id={}). Call team_members for the latest roster, then continue the team's work.",
-        new_lead.slot_id
-    );
-    let old_content = format!(
-        "The team lead role was reassigned to '{}' (slot_id={}). You are now a teammate.",
-        new_lead.name, new_lead.slot_id
-    );
-    (new_content, old_content)
-}
-
 pub struct TeamSession {
     team: Team,
     scheduler: Arc<TeammateManager>,
@@ -1555,7 +1541,7 @@ impl TeamSession {
         // In-flight enqueue leases are never aborted here, so a failed commit
         // cannot mark a row read (see `commit_persisted_enqueue`).
         self.mailbox
-            .apply_lead_handoff_mail(&self.team.id, &member_slots, old_lead, new_lead)
+            .apply_lead_handoff_mail(&self.team.id, &member_slots, old_lead, new_lead, true)
             .await
     }
 
@@ -1584,12 +1570,12 @@ impl TeamSession {
         // forwarded in this window.
         match self.catch_up_lead_mail(old_lead, new_lead).await {
             Ok(handoff) => {
-                if let Some(notice) = &handoff.forward_notice {
+                for report in &handoff.forwarded_reports {
                     self.project_team_system_message(
                         &new_lead.slot_id,
                         &new_lead.conversation_id,
-                        &notice.id,
-                        &notice.content,
+                        &report.id,
+                        &report.content,
                     )
                     .await;
                 }
@@ -1600,6 +1586,55 @@ impl TeamSession {
                 "lead handoff could not catch up late lead mail"
             ),
         }
+
+        // Every handoff row (forwarded reports, both role notices) was stored by
+        // the same mail transaction; project them here and wake only the new
+        // lead. The wake is enqueued BEFORE the slot resyncs so the coordinator
+        // already knows the notice's intent and cannot create a duplicate one.
+        for report in &preparation.forwarded_reports {
+            self.project_team_system_message(
+                &new_lead.slot_id,
+                &new_lead.conversation_id,
+                &report.id,
+                &report.content,
+            )
+            .await;
+        }
+        if let Some(notice) = &preparation.old_lead_notice {
+            self.project_team_system_message(
+                &old_lead.slot_id,
+                &old_lead.conversation_id,
+                &notice.id,
+                &notice.content,
+            )
+            .await;
+        }
+        if let Some(notice) = &preparation.new_lead_notice {
+            self.project_team_system_message(
+                &new_lead.slot_id,
+                &new_lead.conversation_id,
+                &notice.id,
+                &notice.content,
+            )
+            .await;
+            if let Err(error) = self
+                .enqueue_system_work(
+                    &new_lead.slot_id,
+                    WorkSource::TeamMembershipChanged,
+                    Some(notice.id.clone()),
+                    None,
+                )
+                .await
+            {
+                warn!(
+                    team_id = %self.team.id,
+                    slot_id = %new_lead.slot_id,
+                    error = %error,
+                    "lead handoff could not wake the new lead"
+                );
+            }
+        }
+
         if let Err(error) = self
             .resync_slot_after_handoff(&old_lead.slot_id, TeammateRole::Teammate)
             .await
@@ -1622,78 +1657,6 @@ impl TeamSession {
                 "lead handoff could not resync the new lead's slot"
             );
         }
-
-        // Role notice texts are shared with the stopped-team path so both write
-        // the same durable mail.
-        let (new_content, old_content) = lead_handoff_notice_contents(new_lead);
-
-        // Old lead: projected and settled read, so it is genuinely passive and
-        // a demoted, out-of-credits member can never be woken by it.
-        match self
-            .write_lead_notice(&old_lead.slot_id, &old_lead.conversation_id, &old_content)
-            .await
-        {
-            Ok(notice) => {
-                if let Err(error) = self
-                    .mailbox
-                    .mark_read_batch(&self.team.id, std::slice::from_ref(&notice.id))
-                    .await
-                {
-                    warn!(
-                        team_id = %self.team.id,
-                        error = %error,
-                        "lead handoff could not settle the old lead notice"
-                    );
-                }
-            }
-            Err(error) => warn!(
-                team_id = %self.team.id,
-                error = %error,
-                "lead handoff could not write the old lead notice"
-            ),
-        }
-
-        // The forwarded notice for the new lead's own settled reports was
-        // written in the same transaction as the mail move; project it here.
-        if let Some(notice) = &preparation.forward_notice {
-            self.project_team_system_message(
-                &new_lead.slot_id,
-                &new_lead.conversation_id,
-                &notice.id,
-                &notice.content,
-            )
-            .await;
-        }
-
-        // New lead: notice plus the wake that carries the role prompt.
-        match self
-            .write_lead_notice(&new_lead.slot_id, &new_lead.conversation_id, &new_content)
-            .await
-        {
-            Ok(notice) => {
-                if let Err(error) = self
-                    .enqueue_system_work(
-                        &new_lead.slot_id,
-                        WorkSource::TeamMembershipChanged,
-                        Some(notice.id),
-                        None,
-                    )
-                    .await
-                {
-                    warn!(
-                        team_id = %self.team.id,
-                        slot_id = %new_lead.slot_id,
-                        error = %error,
-                        "lead handoff could not wake the new lead"
-                    );
-                }
-            }
-            Err(error) => warn!(
-                team_id = %self.team.id,
-                error = %error,
-                "lead handoff could not write the new lead notice"
-            ),
-        }
     }
 
     /// Move lead-directed mail that landed while the transfer hold was up, and
@@ -1712,30 +1675,8 @@ impl TeamSession {
             .map(|agent| agent.slot_id)
             .collect();
         self.mailbox
-            .apply_lead_handoff_mail(&self.team.id, &member_slots, old_lead, new_lead)
+            .apply_lead_handoff_mail(&self.team.id, &member_slots, old_lead, new_lead, false)
             .await
-    }
-
-    async fn write_lead_notice(
-        &self,
-        slot_id: &str,
-        conversation_id: &str,
-        content: &str,
-    ) -> Result<MailboxMessage, TeamError> {
-        let notice = self
-            .mailbox
-            .write(
-                &self.team.id,
-                slot_id,
-                "team_system",
-                MailboxMessageType::Message,
-                content,
-                None,
-            )
-            .await?;
-        self.project_team_system_message(slot_id, conversation_id, &notice.id, &notice.content)
-            .await;
-        Ok(notice)
     }
 
     /// Rebuild one slot's coordinator view after a role swap: drop queued
@@ -4785,15 +4726,20 @@ mod tests {
             )
             .await
             .unwrap();
+        let report_body = format!(
+            "worker report to the lead\nfirst line with detail\nsecond line with more detail\nthird line\n{}",
+            "x".repeat(200)
+        );
         session
             .mailbox()
-            .write(
+            .write_with_files(
                 &team_id,
                 &lead,
                 &worker,
                 MailboxMessageType::Message,
-                "worker report to the lead",
-                None,
+                &report_body,
+                Some("worker report summary"),
+                Some(&["/tmp/attachment-one.txt".to_owned(), "/tmp/attachment-two.txt".to_owned()]),
             )
             .await
             .unwrap();
@@ -4831,16 +4777,29 @@ mod tests {
         let contents: Vec<&str> = new_unread.iter().map(|message| message.content.as_str()).collect();
         assert!(contents.contains(&"user mail for the lead"), "{contents:?}");
         assert!(contents.contains(&"worker idle"), "{contents:?}");
-        assert!(
-            !contents.contains(&"worker report to the lead"),
-            "the self-authored report row must not be rerouted self-addressed: {contents:?}"
+        // The full report survives: same body (line breaks and all) and files,
+        // with attribution in the summary; no acknowledgement-only placeholder.
+        let forwarded = new_unread
+            .iter()
+            .find(|message| message.content == report_body)
+            .expect("the full report must be forwarded verbatim");
+        assert_eq!(
+            forwarded.files.as_deref(),
+            Some(["/tmp/attachment-one.txt".to_owned(), "/tmp/attachment-two.txt".to_owned()].as_slice()),
+            "the forwarded report must keep its file references"
         );
         assert!(
-            contents
-                .iter()
-                .any(|content| content.contains("worker report to the lead")
-                    && content.contains("settled without action")),
-            "the settled report must still be visible to the new lead: {contents:?}"
+            forwarded
+                .summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Forwarded report from Worker"),
+            "the forwarded report must be attributed: {:?}",
+            forwarded.summary
+        );
+        assert!(
+            !contents.iter().any(|content| content.contains("settled without action")),
+            "the report must be forwarded, not acknowledged: {contents:?}"
         );
 
         let old_unread = session.mailbox().peek_unread(&team_id, &lead).await.unwrap();
@@ -4857,7 +4816,7 @@ mod tests {
         );
         let settled_report = old_history
             .iter()
-            .find(|message| message.content == "worker report to the lead")
+            .find(|message| message.content == report_body)
             .expect("the settled report must stay in history");
         assert!(
             settled_report.read,
