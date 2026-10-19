@@ -28,7 +28,7 @@ use tokio::sync::{Mutex, broadcast, oneshot};
 use super::argv::{ArgvInput, build_argv};
 use super::models::probe_models;
 use super::skills::skill_commands_from_dirs;
-use super::translate::Translator;
+use super::translate::{TerminalDiagnostics, Translator};
 use super::wire::parse_line;
 use crate::backend::cli_version::session_drift_notice;
 use crate::backend::types::{
@@ -122,6 +122,56 @@ fn final_turn_text(is_error: bool, result_text: &str, buffered: &str) -> Option<
 /// join case is touched: a U+FFFD away from a boundary passes through, since
 /// only the buffered fallback of a failed or cancelled turn ever renders this
 /// text (a successful turn is replaced wholesale by `result.response`).
+/// Exit fields safe to log. `None` from `exit_status()` is not "still running"
+/// when wait itself failed, so the state word is separate from the code.
+fn exit_log_fields(exit: Option<aionui_process::TerminalExit>) -> (Option<i32>, Option<bool>, &'static str) {
+    match exit {
+        Some(aionui_process::TerminalExit::Exited(status)) => (status.code(), Some(status.success()), "exited"),
+        Some(aionui_process::TerminalExit::WaitErrored) => (None, None, "wait_errored"),
+        None => (None, None, "still_running"),
+    }
+}
+
+fn synthesized_classification(exit_success: Option<bool>) -> &'static str {
+    if exit_success == Some(true) {
+        "synthesized_exit_success"
+    } else {
+        "synthesized_exit_failure"
+    }
+}
+
+fn log_wire_terminal(session_id: &str, diag: &TerminalDiagnostics, exit: Option<aionui_process::TerminalExit>) {
+    let (exit_code, exit_success, exit_state) = exit_log_fields(exit);
+    tracing::info!(
+        session_id = %session_id,
+        saw_terminal = true,
+        result_status = %diag.status,
+        is_error = diag.is_error,
+        outcome = diag.outcome,
+        failed_steps = diag.failed_steps,
+        exit_code = exit_code,
+        exit_success = exit_success,
+        exit_state = exit_state,
+        classification = "wire_result",
+        "antigravity: turn terminal"
+    );
+    if exit_success == Some(false) && !diag.is_error {
+        tracing::warn!(
+            session_id = %session_id,
+            result_status = %diag.status,
+            exit_code = exit_code,
+            "antigravity: wire result is not an error but the process exited unsuccessfully"
+        );
+    } else if exit_success == Some(true) && diag.is_error {
+        tracing::warn!(
+            session_id = %session_id,
+            result_status = %diag.status,
+            exit_code = exit_code,
+            "antigravity: wire result is an error but the process exited successfully"
+        );
+    }
+}
+
 fn append_delta(buffered: &mut String, delta: &str) {
     const REPLACEMENT: char = '\u{FFFD}';
     let mut delta = delta;
@@ -807,11 +857,28 @@ impl AntigravitySessionBackend {
                 tracing::debug!(session_id = %session_id, model = %model, "agy turn model confirmed");
             }
 
+            // A result frame already classified the turn. Log that class plus
+            // whatever exit is already known, without waiting and without the
+            // reply. A missing frame still synthesizes from the exit below;
+            // that mapping is unchanged.
+            if let Some(diag) = translator.terminal_diagnostics() {
+                log_wire_terminal(&session_id, diag, proc.terminal_exit());
+            }
+
             // A cancelled or crashed run exits without emitting `result`; the
             // FSM still needs a terminal, so synthesize one from the exit.
             if !saw_terminal {
                 let exit = proc.wait_for_exit().await;
-                let ok = exit.map(|s| s.success()).unwrap_or(false);
+                let exit_success = exit.as_ref().map(|s| s.success());
+                let ok = exit_success.unwrap_or(false);
+                tracing::warn!(
+                    session_id = %session_id,
+                    saw_terminal = false,
+                    exit_code = exit.as_ref().and_then(|s| s.code()),
+                    exit_success = exit_success,
+                    classification = synthesized_classification(exit_success),
+                    "antigravity: no result frame; terminal synthesized from process exit"
+                );
                 let _ = event_tx.send(SessionEnvelope {
                     session_id: session_id.clone(),
                     turn_gen,
@@ -1148,6 +1215,26 @@ mod tests {
             .open_session(spec, config("/w"))
             .await
             .expect("open_session must not fail — agy spawns nothing until the first turn")
+    }
+
+    #[test]
+    fn exit_log_fields_do_not_invent_success() {
+        assert_eq!(super::exit_log_fields(None), (None, None, "still_running"));
+        assert_eq!(
+            super::exit_log_fields(Some(aionui_process::TerminalExit::WaitErrored)),
+            (None, None, "wait_errored")
+        );
+        assert_eq!(
+            super::synthesized_classification(Some(true)),
+            "synthesized_exit_success"
+        );
+        assert_eq!(
+            super::synthesized_classification(Some(false)),
+            "synthesized_exit_failure"
+        );
+        // No status is the same class as a failed exit: the synthesizer treats
+        // `unwrap_or(false)` as failure and this label must not say otherwise.
+        assert_eq!(super::synthesized_classification(None), "synthesized_exit_failure");
     }
 
     fn send(text: &str) -> Command {
