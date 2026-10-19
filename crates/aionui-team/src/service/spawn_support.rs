@@ -161,7 +161,10 @@ fn json_available_modes_advertise_mode(raw: Option<&str>, mode: &str) -> bool {
         return false;
     };
 
-    let available_modes = value.get("available_modes").and_then(serde_json::Value::as_array);
+    let available_modes = value
+        .get("available_modes")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| value.as_array());
     available_modes.is_some_and(|modes| {
         modes.iter().any(|entry| {
             entry.as_str() == Some(mode) || entry.get("id").and_then(serde_json::Value::as_str) == Some(mode)
@@ -1142,6 +1145,25 @@ pub(crate) mod tests {
         );
         assert_eq!(
             inherited_team_mode_for_backend(Some("not-advertised"), "claude", AgentType::Acp, Some(&row)),
+            "bypassPermissions"
+        );
+    }
+
+    #[test]
+    fn flat_metadata_available_modes_advertise_only_listed_ids() {
+        let mut row = agent_metadata_row("claude", Some("bypassPermissions"));
+        row.available_modes = Some(r#"[{"id":"code","name":"Code"},{"id":"plan","name":"Plan"}]"#.to_owned());
+
+        assert_eq!(
+            team_mode_for_backend(Some("code"), "claude", AgentType::Acp, Some(&row)).as_deref(),
+            Some("code")
+        );
+        assert_eq!(
+            team_mode_for_backend(Some("stale-mode"), "claude", AgentType::Acp, Some(&row)),
+            None
+        );
+        assert_eq!(
+            inherited_team_mode_for_backend(Some("stale-mode"), "claude", AgentType::Acp, Some(&row)),
             "bypassPermissions"
         );
     }
