@@ -4951,6 +4951,14 @@ mod tests {
         };
         entered.notified().await;
 
+        // The in-flight send holds the shared side, so the exclusive side must
+        // be unavailable right now. This asserts serialization directly rather
+        // than relying only on the delay and the final mailbox state.
+        assert!(
+            session.scheduler().routing_barrier.try_write().is_err(),
+            "an in-flight lead-directed send must block the swap's exclusive guard"
+        );
+
         // Real swap path: exclusive routing guard, then prepare + commit.
         let swap = {
             let session = session.clone();
