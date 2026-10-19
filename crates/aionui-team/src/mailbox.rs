@@ -57,7 +57,10 @@ fn notice_row(message: &MailboxMessage) -> MailboxMessageRow {
         msg_type: message.msg_type.to_string(),
         content: message.content.clone(),
         summary: message.summary.clone(),
-        files: message.files.as_ref().map(|files| serde_json::to_string(files).unwrap_or_default()),
+        files: message
+            .files
+            .as_ref()
+            .map(|files| serde_json::to_string(files).unwrap_or_default()),
         read: message.read,
         created_at: message.created_at,
     }
@@ -252,7 +255,10 @@ impl Mailbox {
                         from_agent_id: "team_system".to_owned(),
                         msg_type: MailboxMessageType::Message,
                         content: message.content.clone(),
-                        summary: Some(format!("Forwarded report from {} ({})", new_lead.name, new_lead.slot_id)),
+                        summary: Some(format!(
+                            "Forwarded report from {} ({})",
+                            new_lead.name, new_lead.slot_id
+                        )),
                         files: message.files.clone(),
                         read: false,
                         created_at: now_ms(),

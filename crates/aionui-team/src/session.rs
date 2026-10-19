@@ -4788,7 +4788,10 @@ mod tests {
                 MailboxMessageType::Message,
                 &report_body,
                 Some("worker report summary"),
-                Some(&["/tmp/attachment-one.txt".to_owned(), "/tmp/attachment-two.txt".to_owned()]),
+                Some(&[
+                    "/tmp/attachment-one.txt".to_owned(),
+                    "/tmp/attachment-two.txt".to_owned(),
+                ]),
             )
             .await
             .unwrap();
@@ -4838,7 +4841,13 @@ mod tests {
             .expect("the full report must be forwarded verbatim");
         assert_eq!(
             forwarded.files.as_deref(),
-            Some(["/tmp/attachment-one.txt".to_owned(), "/tmp/attachment-two.txt".to_owned()].as_slice()),
+            Some(
+                [
+                    "/tmp/attachment-one.txt".to_owned(),
+                    "/tmp/attachment-two.txt".to_owned()
+                ]
+                .as_slice()
+            ),
             "the forwarded report must keep its file references"
         );
         assert!(
@@ -4851,7 +4860,9 @@ mod tests {
             forwarded.summary
         );
         assert!(
-            !contents.iter().any(|content| content.contains("settled without action")),
+            !contents
+                .iter()
+                .any(|content| content.contains("settled without action")),
             "the report must be forwarded, not acknowledged: {contents:?}"
         );
 
