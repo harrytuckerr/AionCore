@@ -94,6 +94,29 @@ pub struct SpawnAgentRequest {
     pub assistant_id: Option<String>,
 }
 
+/// What [`TeamSession::prepare_lead_handoff`] settled on the way to a lead swap,
+/// carried into [`TeamSession::commit_lead_handoff`] so the new lead is told
+/// about reports that could not be delivered as mailbox rows.
+#[derive(Debug, Default)]
+pub(crate) struct LeadHandoffPreparation {
+    /// Bounded, single-line excerpts of the new lead's own reports that were
+    /// addressed to the previous lead (they cannot be delivered back to their
+    /// author). The original rows keep their author and stay in history.
+    settled_reports: Vec<String>,
+}
+
+/// One bounded, single-line excerpt for the handoff notice. No payload dumps:
+/// the notice names what was filed, not the full body.
+fn bounded_excerpt(content: &str) -> String {
+    const MAX_CHARS: usize = 160;
+    let single_line = content.replace(['\n', '\r'], " ");
+    let mut excerpt: String = single_line.chars().take(MAX_CHARS).collect();
+    if single_line.chars().count() > MAX_CHARS {
+        excerpt.push('…');
+    }
+    excerpt
+}
+
 pub struct TeamSession {
     team: Team,
     scheduler: Arc<TeammateManager>,
@@ -1529,10 +1552,18 @@ impl TeamSession {
         &self,
         old_lead: &TeamAgent,
         new_lead: &TeamAgent,
-    ) -> Result<(), TeamError> {
+    ) -> Result<LeadHandoffPreparation, TeamError> {
+        let member_slots: std::collections::HashSet<String> = self
+            .scheduler
+            .list_agents()
+            .await
+            .into_iter()
+            .map(|agent| agent.slot_id)
+            .collect();
         let unread = self.mailbox.peek_unread(&self.team.id, &old_lead.slot_id).await?;
         let mut settled_ids = Vec::new();
         let mut rerouted_ids = Vec::new();
+        let mut settled_reports = Vec::new();
         for message in unread {
             if !matches!(
                 message.msg_type,
@@ -1541,12 +1572,22 @@ impl TeamSession {
                 continue;
             }
             if message.from_agent_id == new_lead.slot_id {
-                // The new lead's own report addressed to the old lead cannot be
-                // delivered to its author (batch preparation and peek both
-                // filter self-authored rows), so settle it instead of stranding
-                // it with the demoted lead.
-                settled_ids.push(message.id);
-            } else {
+                // The new lead's own rows cannot be delivered back to their
+                // author (both batch preparation and peek filter self-authored
+                // rows), so settle them here. Reports are surfaced through a
+                // bounded handoff notice instead of being silently dropped.
+                settled_ids.push(message.id.clone());
+                if message.msg_type == MailboxMessageType::Message {
+                    settled_reports.push(bounded_excerpt(&message.content));
+                }
+                continue;
+            }
+            // Only user mail and actual teammates are handed over; a system or
+            // control author, or the old lead's own rows, stay with the slot
+            // they addressed.
+            let eligible = message.from_agent_id == "user"
+                || (member_slots.contains(&message.from_agent_id) && message.from_agent_id != old_lead.slot_id);
+            if eligible {
                 rerouted_ids.push(message.id);
             }
         }
@@ -1554,13 +1595,15 @@ impl TeamSession {
             self.mailbox.mark_read_batch(&self.team.id, &settled_ids).await?;
         }
         // A single statement: if it fails, nothing has moved and the caller can
-        // roll back without restoring mail.
+        // roll back without restoring mail. In-flight enqueue leases are never
+        // aborted here, so a failed commit cannot mark a row read (see
+        // `commit_persisted_enqueue`).
         if !rerouted_ids.is_empty() {
             self.mailbox
                 .retarget_mail(&self.team.id, &rerouted_ids, &new_lead.slot_id)
                 .await?;
         }
-        Ok(())
+        Ok(LeadHandoffPreparation { settled_reports })
     }
 
     /// Apply the in-memory half of a lead handoff.
@@ -1568,12 +1611,21 @@ impl TeamSession {
     /// Infallible by design: the roster and both conversation roles are already
     /// committed, so every step here is an in-memory mutation or a best-effort
     /// store write that is logged, never propagated.
-    pub(crate) async fn commit_lead_handoff(&self, old_lead: &TeamAgent, new_lead: &TeamAgent) {
+    pub(crate) async fn commit_lead_handoff(
+        &self,
+        old_lead: &TeamAgent,
+        new_lead: &TeamAgent,
+        preparation: &LeadHandoffPreparation,
+    ) {
         // One lock: swapping the two roles separately would expose a two-lead or
         // no-lead roster to unrelated idle routing.
         self.scheduler
             .swap_lead_roles(&old_lead.slot_id, &new_lead.slot_id)
             .await;
+        // An explicitly promoted slot must not stay paused (a member paused after
+        // delivery failures would otherwise become a permanently silent lead).
+        // The demoted slot's own pause is preserved.
+        self.work_coordinator.clear_slot_pause(&new_lead.slot_id);
         // Rows written while the hold was up still target the old lead; move
         // them now that the swap is real (idempotent).
         if let Err(error) = self.catch_up_lead_mail(old_lead, new_lead).await {
@@ -1634,6 +1686,32 @@ impl TeamSession {
                 error = %error,
                 "lead handoff could not write the old lead notice"
             ),
+        }
+
+        // Reports the new lead filed to the previous lead cannot be delivered
+        // as rows (both batch preparation and peek filter self-authored rows),
+        // so surface them in one bounded notice instead of dropping them. The
+        // original rows keep their author and stay in history.
+        if !preparation.settled_reports.is_empty() {
+            let list = preparation
+                .settled_reports
+                .iter()
+                .map(|excerpt| format!("- {excerpt}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let content = format!(
+                "Reports you filed to the previous lead during the handoff were settled without action:\n{list}"
+            );
+            if let Err(error) = self
+                .write_lead_notice(&new_lead.slot_id, &new_lead.conversation_id, &content)
+                .await
+            {
+                warn!(
+                    team_id = %self.team.id,
+                    error = %error,
+                    "lead handoff could not write the settled-reports notice"
+                );
+            }
         }
 
         // New lead: notice plus the wake that carries the role prompt.
@@ -4720,12 +4798,30 @@ mod tests {
             .expect("worker")
             .slot_id;
 
+        // A second real teammate so the idle-notification sender is an actual
+        // roster member (the handoff only forwards user/teammate mail).
+        session
+            .scheduler()
+            .add_agent(&TeamAgent {
+                slot_id: "worker-2".into(),
+                name: "Worker Two".into(),
+                role: TeammateRole::Teammate,
+                conversation_id: "c3".into(),
+                backend: "acp".into(),
+                model: "claude".into(),
+                assistant_id: None,
+                status: None,
+                conversation_type: None,
+                cli_path: None,
+            })
+            .await;
+
         session
             .mailbox()
             .write(
                 &team_id,
                 &lead,
-                "user-1",
+                "user",
                 MailboxMessageType::Message,
                 "user mail for the lead",
                 None,
@@ -4757,18 +4853,33 @@ mod tests {
             .await
             .unwrap();
 
+        // Both slots are paused: the promoted slot must resume, the demoted one
+        // must keep its pause.
+        session.work_coordinator().pause_slot(&lead);
+        session.work_coordinator().pause_slot(&worker);
+
         let old_lead = session.scheduler().get_agent(&lead).await.unwrap();
         let new_lead = session.scheduler().get_agent(&worker).await.unwrap();
-        session
+        let preparation = session
             .prepare_lead_handoff(&old_lead, &new_lead)
             .await
             .expect("handoff preparation");
-        session.commit_lead_handoff(&old_lead, &new_lead).await;
+        session.commit_lead_handoff(&old_lead, &new_lead, &preparation).await;
 
         assert_eq!(
             session.scheduler().find_lead_slot_id().await.as_deref(),
             Some(worker.as_str()),
             "the promoted slot must be the live lead"
+        );
+        assert_ne!(
+            session.work_coordinator().slot_snapshot(&worker).unwrap().state,
+            SlotPhase::Paused,
+            "the promoted slot must be resumed"
+        );
+        assert_eq!(
+            session.work_coordinator().slot_snapshot(&lead).unwrap().state,
+            SlotPhase::Paused,
+            "the demoted slot's pause must be preserved"
         );
 
         let new_unread = session.mailbox().peek_unread(&team_id, &worker).await.unwrap();
@@ -4777,7 +4888,14 @@ mod tests {
         assert!(contents.contains(&"worker idle"), "{contents:?}");
         assert!(
             !contents.contains(&"worker report to the lead"),
-            "the new lead's own report must be settled, not rerouted self-addressed: {contents:?}"
+            "the self-authored report row must not be rerouted self-addressed: {contents:?}"
+        );
+        assert!(
+            contents
+                .iter()
+                .any(|content| content.contains("worker report to the lead")
+                    && content.contains("settled without action")),
+            "the settled report must still be visible to the new lead: {contents:?}"
         );
 
         let old_unread = session.mailbox().peek_unread(&team_id, &lead).await.unwrap();
@@ -4791,6 +4909,18 @@ mod tests {
                 .iter()
                 .any(|message| message.content.contains("reassigned") && message.read),
             "the old lead notice must exist and be settled read"
+        );
+        let settled_report = old_history
+            .iter()
+            .find(|message| message.content == "worker report to the lead")
+            .expect("the settled report must stay in history");
+        assert!(
+            settled_report.read,
+            "the settled report must be read so it cannot wake the old lead"
+        );
+        assert_eq!(
+            settled_report.from_agent_id, worker,
+            "the settled report must keep its original author"
         );
     }
 
@@ -4838,8 +4968,8 @@ mod tests {
 
         let old_lead = session.scheduler().get_agent(&lead).await.unwrap();
         let new_lead = session.scheduler().get_agent(&worker).await.unwrap();
-        session.prepare_lead_handoff(&old_lead, &new_lead).await.unwrap();
-        session.commit_lead_handoff(&old_lead, &new_lead).await;
+        let preparation = session.prepare_lead_handoff(&old_lead, &new_lead).await.unwrap();
+        session.commit_lead_handoff(&old_lead, &new_lead, &preparation).await;
 
         // Register the loop only now: the handoff's own notify is dropped, so the
         // pre-swap intent is still unclaimed for this manual pass.
@@ -4874,8 +5004,8 @@ mod tests {
 
         let old_lead = session.scheduler().get_agent(&lead).await.unwrap();
         let new_lead = session.scheduler().get_agent(&worker).await.unwrap();
-        session.prepare_lead_handoff(&old_lead, &new_lead).await.unwrap();
-        session.commit_lead_handoff(&old_lead, &new_lead).await;
+        let preparation = session.prepare_lead_handoff(&old_lead, &new_lead).await.unwrap();
+        session.commit_lead_handoff(&old_lead, &new_lead, &preparation).await;
 
         let demoted = session
             .spawn_agent(&lead, spawn_req(Some("word-creator")))

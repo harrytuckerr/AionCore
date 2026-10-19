@@ -1153,6 +1153,18 @@ impl SlotWorkCoordinator {
         }
     }
 
+    /// Clear a slot's pause without touching anything else.
+    ///
+    /// Used by an explicit lead promotion: a member paused after delivery
+    /// failures must not stay permanently paused once it is the lead, while the
+    /// demoted slot's own pause is preserved.
+    pub(crate) fn clear_slot_pause(&self, slot_id: &str) {
+        let mut state = self.lock_state();
+        if let Some(slot) = state.slots.get_mut(slot_id) {
+            slot.paused = false;
+        }
+    }
+
     pub(crate) fn set_runtime_constraint(
         &self,
         slot_id: &str,

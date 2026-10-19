@@ -1214,8 +1214,10 @@ impl TeamSessionService {
             })
             .ok_or_else(|| TeamError::InvalidRequest("team has no lead".into()))?;
         if current_lead_slot == target.slot_id {
-            // Already the lead: a deliberate no-op, with no event.
-            return Ok(team.to_response());
+            // Already the lead: a deliberate no-op, with no event. The response
+            // still goes through the shared builder so icons, pending
+            // confirmations, and context-reset capabilities match `get_team`.
+            return self.build_team_response(user_id, &team).await;
         }
         if let Some(starting) = team
             .agents
@@ -1289,7 +1291,8 @@ impl TeamSessionService {
         self.broadcast_team_list_changed(user_id, team_id, "updated");
 
         let row = self.load_owned_team_row(user_id, team_id).await?;
-        Ok(Team::from_row(&row)?.to_response())
+        let team = Team::from_row(&row)?;
+        self.build_team_response(user_id, &team).await
     }
 
     /// Commit the roster swap and its runtime consequences. Split out so the
@@ -1339,8 +1342,8 @@ impl TeamSessionService {
         // roster back; the live swap that follows is in-memory and cannot fail,
         // so no partial live state can outlive a failed request.
         if let Some(session) = session {
-            session.prepare_lead_handoff(old_lead, new_lead).await?;
-            session.commit_lead_handoff(old_lead, new_lead).await;
+            let preparation = session.prepare_lead_handoff(old_lead, new_lead).await?;
+            session.commit_lead_handoff(old_lead, new_lead, &preparation).await;
         }
         Ok(())
     }
