@@ -110,6 +110,19 @@ pub trait ITeamRepository: Send + Sync {
     /// Marks the given message IDs as read. IDs that don't exist are silently ignored.
     async fn mark_read_batch(&self, user_id: &str, team_id: &str, ids: &[String]) -> Result<(), DbError>;
 
+    /// Re-point the given mailbox rows to another recipient.
+    ///
+    /// Used by a lead handoff to move unread lead-directed mail to the new lead
+    /// (and to restore it on rollback) while preserving ids, read state, and
+    /// history. Rows are matched by id, so the caller controls eligibility.
+    async fn retarget_mailbox_ids(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        ids: &[String],
+        to_agent_id: &str,
+    ) -> Result<u64, DbError>;
+
     /// Returns message history for an agent, optionally limited.
     /// Messages are ordered by `created_at` ascending.
     async fn get_history(

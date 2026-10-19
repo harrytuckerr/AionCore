@@ -1047,6 +1047,17 @@ impl ITeamRepository for FullMockTeamRepo {
     async fn mark_read_batch(&self, user_id: &str, team_id: &str, ids: &[String]) -> Result<(), DbError> {
         self.inner.mark_read_batch(user_id, team_id, ids).await
     }
+    async fn retarget_mailbox_ids(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        ids: &[String],
+        to_agent_id: &str,
+    ) -> Result<u64, DbError> {
+        self.inner
+            .retarget_mailbox_ids(user_id, team_id, ids, to_agent_id)
+            .await
+    }
     async fn get_history(
         &self,
         user_id: &str,

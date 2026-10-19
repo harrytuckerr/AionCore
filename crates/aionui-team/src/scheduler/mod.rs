@@ -185,4 +185,20 @@ impl TeammateManager {
             .find(|s| s.agent.role == TeammateRole::Lead)
             .map(|s| s.agent.slot_id.clone())
     }
+
+    /// Swap the lead and teammate roles in ONE lock, so idle routing can never
+    /// observe a two-lead or no-lead roster, and arm both role prompts so the
+    /// next wake re-injects the prompt for the new role.
+    pub(crate) async fn swap_lead_roles(&self, old_lead_slot: &str, new_lead_slot: &str) {
+        let mut slots = self.slots.lock().await;
+        for slot in slots.values_mut() {
+            if slot.agent.slot_id == new_lead_slot {
+                slot.agent.role = TeammateRole::Lead;
+                slot.needs_role_prompt = true;
+            } else if slot.agent.slot_id == old_lead_slot {
+                slot.agent.role = TeammateRole::Teammate;
+                slot.needs_role_prompt = true;
+            }
+        }
+    }
 }

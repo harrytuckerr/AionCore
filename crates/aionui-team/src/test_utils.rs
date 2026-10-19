@@ -157,6 +157,24 @@ impl ITeamRepository for MockTeamRepo {
         Ok(())
     }
 
+    async fn retarget_mailbox_ids(
+        &self,
+        _user_id: &str,
+        team_id: &str,
+        ids: &[String],
+        to_agent_id: &str,
+    ) -> Result<u64, DbError> {
+        let mut state = self.state.lock().unwrap();
+        let mut moved = 0u64;
+        for msg in &mut state.messages {
+            if msg.team_id == team_id && ids.contains(&msg.id) {
+                msg.to_agent_id = to_agent_id.to_owned();
+                moved += 1;
+            }
+        }
+        Ok(moved)
+    }
+
     async fn get_history(
         &self,
         _user_id: &str,
@@ -766,6 +784,23 @@ pub(crate) mod workspace_harness {
                 }
             }
             Ok(())
+        }
+
+        async fn retarget_mailbox_ids(
+            &self,
+            _user_id: &str,
+            team_id: &str,
+            ids: &[String],
+            to_agent_id: &str,
+        ) -> Result<u64, DbError> {
+            let mut moved = 0u64;
+            for message in self.messages.lock().unwrap().iter_mut() {
+                if message.team_id == team_id && ids.contains(&message.id) {
+                    message.to_agent_id = to_agent_id.to_owned();
+                    moved += 1;
+                }
+            }
+            Ok(moved)
         }
 
         async fn get_history(

@@ -320,6 +320,36 @@ impl ITeamRepository for SqliteTeamRepository {
         Ok(())
     }
 
+    async fn retarget_mailbox_ids(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        ids: &[String],
+        to_agent_id: &str,
+    ) -> Result<u64, DbError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut moved = 0u64;
+        // SQLite placeholder limit is 999; batch if needed.
+        for chunk in ids.chunks(500) {
+            let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "UPDATE mailbox SET to_agent_id = ? \
+                 WHERE team_id = ? AND id IN ({placeholders}) \
+                   AND EXISTS (SELECT 1 FROM teams t WHERE t.id = mailbox.team_id AND t.user_id = ?)"
+            );
+            let mut query = sqlx::query(&sql);
+            query = query.bind(to_agent_id).bind(team_id);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            query = query.bind(user_id);
+            moved += query.execute(&self.pool).await?.rows_affected();
+        }
+        Ok(moved)
+    }
+
     async fn get_history(
         &self,
         user_id: &str,

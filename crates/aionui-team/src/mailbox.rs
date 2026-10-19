@@ -166,6 +166,19 @@ impl Mailbox {
         Ok(())
     }
 
+    /// Re-point the given mailbox rows to another recipient.
+    ///
+    /// Used by a lead handoff: ids, read state, and history are preserved, and
+    /// the caller decides which rows are eligible to move.
+    pub async fn retarget_mail(&self, team_id: &str, ids: &[String], to_agent_id: &str) -> Result<u64, TeamError> {
+        let moved = self
+            .repo
+            .retarget_mailbox_ids(&self.user_id, team_id, ids, to_agent_id)
+            .await?;
+        debug!(team_id, to_agent_id, moved, "team mailbox retargeted for lead handoff");
+        Ok(moved)
+    }
+
     /// Runtime-only cancel helper: mark currently unread mailbox rows as read
     /// for the provided agents so a cancelled run does not consume them later.
     pub async fn mark_all_unread_for_agents_read(
