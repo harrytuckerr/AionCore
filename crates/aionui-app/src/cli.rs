@@ -850,6 +850,8 @@ mod tests {
     use clap::Parser;
     use clap::error::ErrorKind;
 
+    use crate::commands::json_input::JsonInputArgs;
+
     use super::{
         Cli, Command, ConfigArgs, ConfigCommand, ConversationCommand, ManagedResourcesModeArg,
         PrepareManagedResourcesArgs, SecretArgs, SecretCommand, SessionCommand, TeamCommand, UserArgs, UserCommand,
