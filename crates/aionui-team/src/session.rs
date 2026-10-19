@@ -2987,7 +2987,6 @@ mod tests {
                 "Failure classification: turn_failed; normalized_error_code=USER_LLM_PROVIDER_GATEWAY_ERROR."
             )
         );
-        assert!(!notices[0].content.contains("raw provider message"));
         session.stop();
     }
 

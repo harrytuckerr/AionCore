@@ -481,7 +481,7 @@ impl ConversationTurnOrchestrator {
         let superseding_tips = SupersedingTipTotals::default();
         let mut replay_started_at = None;
         let mut final_error_message;
-        let mut final_error_code = None;
+        let mut final_error_code;
         let mut auth_failure = false;
 
         info!(conversation_id = %conv_id, turn_id = %turn_id, "conversation turn orchestrator started");
