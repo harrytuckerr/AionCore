@@ -257,10 +257,21 @@ mod tests {
         assert!(!reg.verify("conv-1", &token));
     }
 
+    /// A real file to hand `write_hooks_json` as the binary. Windows
+    /// canonicalizes it before embedding it in the wrapper, so a nonexistent
+    /// path fails the install there by design (see
+    /// `a_failed_wrapper_write_leaves_no_hooks_json_behind`).
+    fn stub_exe(dir: &Path) -> std::path::PathBuf {
+        let exe = dir.join("aioncore.exe");
+        std::fs::write(&exe, b"stub").unwrap();
+        exe
+    }
+
     #[test]
     fn registers_the_bridge_without_embedding_any_policy() {
         let dir = tempfile::tempdir().unwrap();
-        write_hooks_json(dir.path(), Path::new("/opt/aionui/backend")).unwrap();
+        let exe = stub_exe(dir.path());
+        write_hooks_json(dir.path(), &exe).unwrap();
 
         let raw = std::fs::read_to_string(dir.path().join(".agents/hooks.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -273,7 +284,7 @@ mod tests {
         // backend instead of the hook.
         assert_eq!(
             entry["PreToolUse"][0]["hooks"][0]["command"],
-            hook_command(Path::new("/opt/aionui/backend"), cfg!(windows))
+            hook_command(&exe, cfg!(windows))
         );
 
         // The decision must never be baked into the file: AionUi owns it at
@@ -402,7 +413,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".agents")).unwrap();
         std::fs::write(dir.path().join(".agents/hooks.json"), r#"{"old":{"enabled":true}}"#).unwrap();
 
-        write_hooks_json(dir.path(), Path::new("/opt/aionui/backend")).unwrap();
+        write_hooks_json(dir.path(), &stub_exe(dir.path())).unwrap();
         let raw = std::fs::read_to_string(dir.path().join(".agents/hooks.json")).unwrap();
         assert!(!raw.contains("\"old\""), "a stale hook must not survive");
     }
@@ -415,7 +426,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let wrapper = dir.path().join(".agents").join(WINDOWS_WRAPPER_FILE_NAME);
 
-        write_hooks_json(dir.path(), std::path::Path::new("/opt/aionui/aioncore")).unwrap();
+        write_hooks_json(dir.path(), &stub_exe(dir.path())).unwrap();
         assert!(dir.path().join(".agents/hooks.json").exists());
         // The wrapper belongs to the Windows install; off Windows agy runs the
         // quoted binary directly, so no wrapper may appear.
