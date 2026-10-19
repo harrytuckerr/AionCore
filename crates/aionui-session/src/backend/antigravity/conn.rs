@@ -608,11 +608,13 @@ impl AntigravitySessionBackend {
     ///
     /// A non-full-auto install is TWO files on Windows: `hooks.json` names the
     /// wrapper, and the wrapper runs the binary (agy executes handlers through
-    /// `cmd /c`, which mangles a quoted absolute path — verified: the installed
-    /// `agy-customizations/docs/hooks.md`, "Hook Handler Fields"). The wrapper
-    /// is written BEFORE `hooks.json`, so a failed restore never publishes a
-    /// `hooks.json` that points at a file which is not on disk. Off Windows the
-    /// prepared wrapper is `None` and only `hooks.json` is managed.
+    /// `cmd /c` — verified: the installed `agy-customizations/docs/hooks.md`,
+    /// "Hook Handler Fields"). The wrapper exists because the quoted absolute
+    /// path is reporter-observed reaching cmd literally (#4317 stderr, a
+    /// regression of the `\\?\`-verbatim-path fix #4095). It is written BEFORE
+    /// `hooks.json`, so a failed restore never publishes a `hooks.json` that
+    /// points at a file which is not on disk. Off Windows the prepared wrapper
+    /// is `None` and only `hooks.json` is managed.
     fn sync_permission_hook(&self) {
         let Some(cwd) = self.config.cwd.as_deref() else {
             return;
