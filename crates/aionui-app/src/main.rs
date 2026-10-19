@@ -231,56 +231,37 @@ mod tests {
 
     #[test]
     fn path_enhancement_is_only_for_server_doctor_and_prepare() {
-        use crate::cli::{
-            ConfigArgs, ConfigCommand, ConversationArgs, ConversationCommand, DiagnoseArgs, DiagnoseCommand,
-            PrepareManagedResourcesArgs, SecretArgs, SecretCommand, SessionArgs, SessionCommand, SkillsArgs,
-            SkillsCommand, TeamArgs, TeamCommand, UserArgs, UserCommand,
-        };
+        use clap::Parser;
 
-        assert!(command_needs_path_enhancement(None));
-
-        let runtime = [
-            Command::Doctor,
-            Command::PrepareManagedResources(PrepareManagedResourcesArgs {
-                bundle_out: std::path::PathBuf::from("bundle"),
-            }),
+        // Parse argv instead of building arg structs. Integrated WS-1 adds
+        // fields these structs do not have on this branch; naming the fields
+        // would fail there. This does not read or log PATH.
+        let cases = [
+            (&["aioncore"][..], true),
+            (&["aioncore", "doctor"][..], true),
+            (
+                &["aioncore", "prepare-managed-resources", "--bundle-out", "bundle"][..],
+                true,
+            ),
+            (&["aioncore", "capabilities"][..], false),
+            (&["aioncore", "config", "capabilities"][..], false),
+            (&["aioncore", "diagnose", "capabilities"][..], false),
+            (&["aioncore", "team", "capabilities"][..], false),
+            (&["aioncore", "session", "capabilities"][..], false),
+            (&["aioncore", "conversation", "capabilities"][..], false),
+            (&["aioncore", "skills", "capabilities"][..], false),
+            (&["aioncore", "antigravity-hook"][..], false),
+            (&["aioncore", "mcp-team-stdio"][..], false),
+            (&["aioncore", "user", "list"][..], false),
+            (&["aioncore", "secret", "status"][..], false),
         ];
-        for command in runtime {
-            assert!(command_needs_path_enhancement(Some(&command)), "{}", command.as_str());
-        }
-
-        // No PATH text is built or logged here; this only classifies the command.
-        let helpers = [
-            Command::Capabilities,
-            Command::Config(ConfigArgs {
-                command: ConfigCommand::Capabilities,
-            }),
-            Command::Diagnose(DiagnoseArgs {
-                command: DiagnoseCommand::Capabilities,
-            }),
-            Command::Team(TeamArgs {
-                command: TeamCommand::Capabilities,
-            }),
-            Command::Session(SessionArgs {
-                command: SessionCommand::Capabilities,
-            }),
-            Command::Conversation(ConversationArgs {
-                command: ConversationCommand::Capabilities,
-            }),
-            Command::Skills(SkillsArgs {
-                command: SkillsCommand::Capabilities,
-            }),
-            Command::AntigravityHook,
-            Command::McpTeamStdio,
-            Command::User(UserArgs {
-                command: UserCommand::List,
-            }),
-            Command::Secret(SecretArgs {
-                command: SecretCommand::Status,
-            }),
-        ];
-        for command in helpers {
-            assert!(!command_needs_path_enhancement(Some(&command)), "{}", command.as_str());
+        for (argv, enhance) in cases {
+            let cli = Cli::try_parse_from(argv).unwrap_or_else(|error| panic!("parse {argv:?}: {error}"));
+            assert_eq!(
+                command_needs_path_enhancement(cli.command.as_ref()),
+                enhance,
+                "{argv:?}"
+            );
         }
     }
 }
