@@ -57,26 +57,21 @@ pub(crate) struct ArgvInput {
     pub extra_args: Vec<String>,
 }
 
-/// How long agy may wait in print mode before abandoning the turn.
+/// Host limit on waiting for agy's print result.
 ///
-/// agy's own default is 5m0s (`agy --help`, 1.1.9) and it is a wall-clock cap
-/// on the WHOLE turn, not an idle timeout: a long build, a big refactor or a
-/// slow tool run trips it while agy is still making steady progress. Measured
-/// on 1.1.9, the cap fires as a clean terminal frame — `result` with
-/// `status:"ERROR"`, `error:"timeout waiting for response"`, exit 1 — so the
-/// turn dies with an error the user cannot act on.
+/// The captured 1.4.2 help reports a default of `0` (wait until completion;
+/// verified:
+/// `~/aion/protocols/samples/agy/1.4.2/root-probe-help.txt:20`). The host keeps
+/// its existing one-hour policy so scheduled turns have a finite wait.
+/// `1h` was accepted by the real live gates (verified:
+/// `~/aion/protocols/samples/agy/1.4.2/live-ws-http-suite-5345050a.log`).
 ///
-/// It is raised, but NOT removed, because it is the only automatic recovery
-/// this integration has. There is no in-turn silence watchdog anywhere in the
-/// stack: `suspend.rs`'s `last_activity` only moves on dispatch (a session
-/// dormancy TTL), and `collect_idle` skips tasks that are still running. So if
-/// agy goes quiet while alive, the only other ways out are the user's Cancel —
-/// which nobody is there to press on a scheduled run — and this cap.
-///
-/// One hour is therefore the trade: 12× agy's default, comfortably past any
-/// legitimate turn, while still bounding a silent hang instead of parking a
-/// cron conversation for a day. Go duration syntax; verified accepted by agy
-/// 1.1.9 (an unparseable value is a hard flag error).
+/// A short cap does not necessarily produce an error: the captured 8 s and
+/// 12 s invocations returned SUCCESS, partial output, and exit 0 (verified:
+/// `~/aion/protocols/samples/agy/1.4.2/flags-stream-json-print-timeout-8s.stdout.txt`,
+/// `flags-stream-json-print-timeout-12s.stdout.txt`, and their stderr captures).
+/// Those captures establish a partial return while the turn was in progress;
+/// they do not establish cancellation of the underlying work.
 const PRINT_TIMEOUT: &str = "1h";
 
 fn non_blank(value: &Option<String>) -> Option<&str> {
@@ -259,10 +254,9 @@ mod tests {
     }
 
     #[test]
-    fn every_turn_lifts_agys_five_minute_wall_clock_cap() {
-        // Left at agy's 5m0s default, a long-but-healthy turn (big refactor,
-        // slow build) is killed by agy itself while this layer — which has no
-        // wall-clock cap and detects hangs by dead silence — sees nothing wrong.
+    fn every_turn_sets_the_explicit_host_print_limit() {
+        // Keep the host's finite wait on every invocation. The captured CLI
+        // default and partial-return behavior are documented beside the constant.
         for input in [
             base(),
             ArgvInput {
