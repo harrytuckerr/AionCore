@@ -459,9 +459,7 @@ async fn run_mcp(client: &reqwest::Client, args: ConfigMcpArgs, input: &JsonInpu
                     input,
                     "config mcp servers get",
                     Method::GET,
-                    "/api/mcp/servers",
-                    "",
-                    "server_id",
+                    IdRoute::new("/api/mcp/servers", "", "server_id"),
                     true,
                 )
                 .await
@@ -798,9 +796,7 @@ async fn run_agents(
                     input,
                     "config agents overrides get",
                     Method::GET,
-                    "/api/agents",
-                    "/overrides",
-                    "agent_id",
+                    IdRoute::new("/api/agents", "/overrides", "agent_id"),
                     true,
                 )
                 .await
@@ -892,9 +888,7 @@ async fn run_cron_jobs(
                 input,
                 "config cron jobs get",
                 Method::GET,
-                "/api/cron/jobs",
-                "",
-                "job_id",
+                IdRoute::new("/api/cron/jobs", "", "job_id"),
                 false,
             )
             .await
@@ -941,9 +935,7 @@ async fn run_cron_jobs(
                 input,
                 "config cron jobs run",
                 Method::POST,
-                "/api/cron/jobs",
-                "/run",
-                "job_id",
+                IdRoute::new("/api/cron/jobs", "/run", "job_id"),
                 false,
             )
             .await
@@ -955,9 +947,7 @@ async fn run_cron_jobs(
                     input,
                     "config cron jobs skill get",
                     Method::GET,
-                    "/api/cron/jobs",
-                    "/skill",
-                    "job_id",
+                    IdRoute::new("/api/cron/jobs", "/skill", "job_id"),
                     false,
                 )
                 .await
@@ -1155,15 +1145,13 @@ async fn run_id_no_body_request(
     input: &JsonInputArgs,
     command: &'static str,
     method: Method,
-    path_prefix: &'static str,
-    path_suffix: &'static str,
-    id_field: &'static str,
+    route: IdRoute,
     redact_output: bool,
 ) -> Result<(), ConfigError> {
     let env = ConfigEnv::from_env(command)?;
     let payload = read_stdin_payload(command, input)?;
-    let id = required_string_field(&payload, id_field, command)?;
-    let path = id_path(path_prefix, &id, path_suffix);
+    let id = required_string_field(&payload, route.id_field, command)?;
+    let path = route.path(&id);
     let data = request_json(client, &env, method, &path, None, command).await?;
     print_config_output(data, meta(None), command, redact_output)
 }

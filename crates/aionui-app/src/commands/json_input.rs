@@ -394,7 +394,7 @@ fn decode_text(bytes: &[u8]) -> Result<Cow<'_, str>, ()> {
 }
 
 fn decode_utf16(bytes: &[u8], little_endian: bool) -> Result<Cow<'_, str>, ()> {
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err(());
     }
     let units = bytes
