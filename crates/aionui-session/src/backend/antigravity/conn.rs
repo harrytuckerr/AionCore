@@ -255,8 +255,14 @@ pub fn antigravity_capabilities() -> Capabilities {
     }
 }
 
-/// agy's fixed mode axis (`--mode`). Unlike models this never depends on the
-/// account, so it needs no probe.
+/// agy's captured `--mode` values plus AionUi's host-side modes. The 1.4.2
+/// help lists `accept-edits`, `auto`, and `plan` (verified:
+/// `~/aion/protocols/samples/agy/1.4.2/root-probe-help.txt:14`, sha256
+/// `a12355e8fc064b330eeb25ba52de596406582752442e293083bcda6388a63b78`). Account
+/// Help syntax does not prove account availability: the captured account
+/// reported `auto` unavailable and continued in default mode (verified:
+/// `~/aion/protocols/samples/agy/1.4.2/print_stream-json_mode-auto.stderr.txt:1`,
+/// sha256 `a5fba73a86e08667947af7c14279816e503a59027e217db46dd61470521cd36f`).
 pub fn antigravity_modes() -> Vec<ModeInfo> {
     // `yolo` is NOT one of agy's modes — it is AionUi's sentinel for "run
     // without asking", offered here so a user can pick full auto deliberately
@@ -270,6 +276,7 @@ pub fn antigravity_modes() -> Vec<ModeInfo> {
             "Accept Edits",
             Some("File edits are auto-approved; commands still ask."),
         ),
+        ("auto", "Auto", Some("The captured account could not use this mode.")),
         ("plan", "Plan", Some("Research and plan only.")),
         (
             "yolo",
@@ -1939,26 +1946,30 @@ mod tests {
         assert_eq!(caps.current_model.as_deref(), Some("gemini-3.1-pro-high"));
         assert_eq!(
             caps.available_modes.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
-            vec!["default", "accept-edits", "plan", "yolo"]
+            vec!["default", "accept-edits", "auto", "plan", "yolo"]
         );
         assert_eq!(caps.current_mode.as_deref(), Some("plan"));
     }
 
     #[test]
-    fn modes_are_agys_three_plus_the_full_auto_sentinel() {
-        // agy's own axis is default / accept-edits / plan. `yolo` is AionUi's
-        // sentinel for "no approval prompts" — offered as a choice so a user can
-        // pick full auto deliberately, and carried by teams / scheduled runs.
+    fn modes_include_captured_agy_values_and_the_full_auto_sentinel() {
+        // agy's captured 1.4.2 help lists accept-edits / auto / plan; `default`
+        // and `yolo` are AionUi host-side modes (verified:
+        // `~/aion/protocols/samples/agy/1.4.2/root-probe-help.txt:14`, sha256
+        // `a12355e8fc064b330eeb25ba52de596406582752442e293083bcda6388a63b78`).
+        // `yolo` is the sentinel for "no approval prompts", offered as a choice
+        // so a user can pick full auto deliberately and carried by teams / runs.
         let modes = antigravity_modes();
         assert_eq!(
             modes.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
-            vec!["default", "accept-edits", "plan", "yolo"]
+            vec!["default", "accept-edits", "auto", "plan", "yolo"]
         );
         assert_eq!(modes[1].name, "Accept Edits");
+        assert_eq!(modes[2].name, "Auto");
 
         // The two agy explains itself, in agy's own words, plus the sentinel:
         // a mode whose consequence is invisible must say what it does.
-        for id in ["accept-edits", "plan", "yolo"] {
+        for id in ["accept-edits", "auto", "plan", "yolo"] {
             let m = modes.iter().find(|m| m.id == id).unwrap();
             assert!(m.description.is_some(), "{id} needs a description");
         }
