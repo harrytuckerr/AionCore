@@ -27,7 +27,7 @@ pub(crate) fn data() -> Value {
             "terminal_stdin": "not read automatically",
             "empty_implicit_stdin_first_byte_timeout": "empty JSON object",
             "stdin_timeout_env": "AIONUI_CLI_STDIN_TIMEOUT_MS",
-            "stdin_timeout_default_ms": 1500,
+            "stdin_timeout_default_ms": 1000,
             "stdin_timeout_max_ms": 30000,
             "stdin_timeout_error": "TEAM_CLI_STDIN_TIMEOUT",
             "max_bytes": 4194304,
@@ -100,7 +100,7 @@ pub(crate) fn help_markdown() -> String {
 Use aioncore team capabilities for exact schemas.
 
 JSON input: --json JSON takes precedence over --input PATH or --input -; otherwise, piped stdin supplies JSON (verified: crates/aionui-app/src/cli.rs and crates/aionui-app/src/commands/json_input.rs). Terminal stdin is not read automatically.
-If implicit stdin stays open without a first byte for 1500 ms, it is treated as an empty JSON object. Override this wait with AIONUI_CLI_STDIN_TIMEOUT_MS (1-30000 ms). After a byte arrives, a 30 second total read limit applies. Input is limited to 4 MiB.
+If implicit stdin stays open without a first byte for 1000 ms, it is treated as an empty JSON object. Override this wait with AIONUI_CLI_STDIN_TIMEOUT_MS (1-30000 ms). After a byte arrives, a 30 second total read limit applies. Input is limited to 4 MiB.
 An explicit stdin read that times out returns TEAM_CLI_STDIN_TIMEOUT with source, bytes_read, and a 16-byte prefix only (verified: crates/aionui-app/src/commands/cmd_team.rs and crates/aionui-app/src/commands/json_input.rs).
 Run Team CLI commands in the foreground; do not background them.
 
@@ -172,7 +172,7 @@ mod tests {
             serde_json::json!(["--json", "--input", "stdin"])
         );
         assert_eq!(data["input"]["terminal_stdin"], "not read automatically");
-        assert_eq!(data["input"]["stdin_timeout_default_ms"], 1500);
+        assert_eq!(data["input"]["stdin_timeout_default_ms"], 1000);
         assert_eq!(data["input"]["stdin_timeout_max_ms"], 30000);
         assert_eq!(data["input"]["stdin_timeout_error"], "TEAM_CLI_STDIN_TIMEOUT");
         assert_eq!(data["examples"].as_array().unwrap().len(), 5);

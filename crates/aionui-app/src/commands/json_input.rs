@@ -13,7 +13,7 @@ use serde_json::Value;
 
 const MAX_INPUT_BYTES: usize = 4 * 1024 * 1024;
 const READ_CHUNK_BYTES: usize = 8 * 1024;
-const DEFAULT_STDIN_TIMEOUT_MS: u64 = 1_500;
+const DEFAULT_STDIN_TIMEOUT_MS: u64 = 1_000;
 const MAX_STDIN_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_millis(DEFAULT_STDIN_TIMEOUT_MS);
 const OVERALL_READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -435,12 +435,12 @@ mod tests {
 
     #[test]
     fn stdin_timeout_override_uses_default_and_caps_large_values() {
-        assert_eq!(stdin_timeout_from_override(None), Duration::from_millis(1_500));
+        assert_eq!(stdin_timeout_from_override(None), Duration::from_millis(1_000));
         assert_eq!(
             stdin_timeout_from_override(Some("invalid")),
-            Duration::from_millis(1_500)
+            Duration::from_millis(1_000)
         );
-        assert_eq!(stdin_timeout_from_override(Some("0")), Duration::from_millis(1_500));
+        assert_eq!(stdin_timeout_from_override(Some("0")), Duration::from_millis(1_000));
         assert_eq!(
             stdin_timeout_from_override(Some("40000")),
             Duration::from_millis(30_000)

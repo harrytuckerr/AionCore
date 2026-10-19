@@ -55,7 +55,7 @@ Run "$AIONUI_HELPER_BIN" team help when you need a short readable guide.
 Supply JSON with --json JSON (highest precedence), --input PATH,
 --input -, or piped stdin, in that order. Terminal stdin is not read
 automatically. If implicit stdin stays open without a first byte for
-1500 ms, it becomes an empty JSON object; AIONUI_CLI_STDIN_TIMEOUT_MS
+1000 ms, it becomes an empty JSON object; AIONUI_CLI_STDIN_TIMEOUT_MS
 overrides that wait from 1 to 30000 ms. After a byte arrives, the total
 read limit is 30 seconds. Input is limited to 4 MiB. An explicit stdin
 timeout returns TEAM_CLI_STDIN_TIMEOUT with source, bytes_read, and a
