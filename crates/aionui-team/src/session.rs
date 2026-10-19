@@ -5,9 +5,9 @@ use std::time::Instant;
 
 use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{
-    TeamAgentRuntimeStatus, TeamChildTurnPayload, TeamContextResetNotice, TeamContextResetRuntimeStatus,
-    TeamInterruptAgentResponse, TeamInterruptOutcome, TeamMessageEnqueueStatus, TeamQueuedPolicy, TeamRunAckResponse,
-    TeamRunStatus, TeamRunTargetRole, TeamSlotWorkPayload, TeamToolTransport,
+    AgentErrorCode, TeamAgentRuntimeStatus, TeamChildTurnPayload, TeamContextResetNotice,
+    TeamContextResetRuntimeStatus, TeamInterruptAgentResponse, TeamInterruptOutcome, TeamMessageEnqueueStatus,
+    TeamQueuedPolicy, TeamRunAckResponse, TeamRunStatus, TeamRunTargetRole, TeamSlotWorkPayload, TeamToolTransport,
 };
 use aionui_common::{AgentKillReason, generate_id};
 use aionui_db::ITeamRepository;
@@ -94,6 +94,10 @@ pub(crate) enum DeliveryFailureClassification {
     TurnStartSkipped,
     TurnFailed,
     TurnSkipped,
+}
+
+fn normalized_error_code_label(error_code: AgentErrorCode) -> Option<String> {
+    serde_json::to_value(error_code).ok()?.as_str().map(str::to_owned)
 }
 
 impl DeliveryFailureClassification {
@@ -2077,6 +2081,7 @@ impl TeamSession {
         slot_id: &str,
         abandoned_count: usize,
         classification: DeliveryFailureClassification,
+        error_code: Option<AgentErrorCode>,
     ) -> Result<(), TeamError> {
         let Some(lead_slot_id) = self.scheduler.find_lead_slot_id().await else {
             return Ok(());
@@ -2085,13 +2090,18 @@ impl TeamSession {
             // The lead itself stalled; there is no higher authority to notify.
             return Ok(());
         }
+        let error_code_detail = error_code
+            .and_then(normalized_error_code_label)
+            .map(|code| format!("; normalized_error_code={code}"))
+            .unwrap_or_default();
         let content = format!(
             "Teammate {slot_id} could not process {abandoned_count} queued message(s) after \
-             {MAX_MESSAGE_DELIVERY_FAILURES} delivery attempts. Failure classification: {}. \
+             {MAX_MESSAGE_DELIVERY_FAILURES} delivery attempts. Failure classification: {}{}. \
              Those messages were dropped and the \
              teammate is now paused: it will not pick up new work until you interrupt it with \
              team_interrupt_agent or the user intervenes. Check on it before assigning more work.",
-            classification.as_str()
+            classification.as_str(),
+            error_code_detail
         );
         self.mailbox
             .write(
@@ -2535,6 +2545,7 @@ mod tests {
                 conversation_id: request.conversation_id,
                 turn_id: "turn-background".into(),
                 status: crate::ports::AgentTurnStatus::Completed,
+                error_code: None,
                 runtime: None,
             })
         }
@@ -2587,6 +2598,7 @@ mod tests {
                 conversation_id: request.conversation_id,
                 turn_id: "turn-test".into(),
                 status: crate::ports::AgentTurnStatus::Completed,
+                error_code: None,
                 runtime: None,
             })
         }
@@ -2956,24 +2968,26 @@ mod tests {
     #[tokio::test]
     async fn delivery_exhaustion_notice_includes_safe_failure_classification() {
         let session = start_session().await;
-        let error = AgentTurnExecutionError::Failed {
-            reason: "raw provider detail must not reach the notice".into(),
-        };
-        let classification = DeliveryFailureClassification::from_start_error(&error);
+        let classification = DeliveryFailureClassification::from_turn_status(AgentTurnStatus::Failed).unwrap();
 
         session
-            .notify_leader_delivery_exhausted("worker-1", 2, classification)
+            .notify_leader_delivery_exhausted(
+                "worker-1",
+                2,
+                classification,
+                Some(AgentErrorCode::UserLlmProviderGatewayError),
+            )
             .await
             .unwrap();
 
         let notices = session.mailbox().peek_unread("t1", "lead-1").await.unwrap();
         assert_eq!(notices.len(), 1);
         assert!(
-            notices[0]
-                .content
-                .contains("Failure classification: turn_start_failed.")
+            notices[0].content.contains(
+                "Failure classification: turn_failed; normalized_error_code=USER_LLM_PROVIDER_GATEWAY_ERROR."
+            )
         );
-        assert!(!notices[0].content.contains("raw provider detail"));
+        assert!(!notices[0].content.contains("raw provider message"));
         session.stop();
     }
 

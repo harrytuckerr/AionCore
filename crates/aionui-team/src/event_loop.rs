@@ -335,7 +335,7 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
                 .session
                 .work_coordinator()
                 .fail_batch(&batch, classification.as_str());
-            finalize_failed_delivery(ctx, &batch, &failure, classification).await;
+            finalize_failed_delivery(ctx, &batch, &failure, classification, None).await;
             let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Error).await;
             return ExecuteResult::ContinueDraining;
         }
@@ -360,7 +360,7 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
             .session
             .work_coordinator()
             .fail_batch(&batch, classification.as_str());
-        finalize_failed_delivery(ctx, &batch, &failure, classification).await;
+        finalize_failed_delivery(ctx, &batch, &failure, classification, outcome.error_code).await;
         let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Error).await;
         (
             (failure.commit_result == CommitResult::Committed).then_some(TeamRunStatus::Failed),
@@ -423,6 +423,7 @@ async fn finalize_failed_delivery(
     batch: &WorkBatch,
     failure: &BatchFailureResult,
     classification: DeliveryFailureClassification,
+    error_code: Option<aionui_api_types::AgentErrorCode>,
 ) {
     if failure.exhausted_message_ids.is_empty() {
         return;
@@ -432,6 +433,7 @@ async fn finalize_failed_delivery(
         slot_id = %ctx.slot_id,
         batch_id = %batch.batch_id,
         error_classification = classification.as_str(),
+        normalized_error_code = ?error_code,
         exhausted_message_count = failure.exhausted_message_ids.len(),
         "team batch delivery retry limit reached; messages abandoned and slot paused"
     );
@@ -447,7 +449,12 @@ async fn finalize_failed_delivery(
     // infer an ack from provider text when a failed turn may have side effects.
     if let Err(error) = ctx
         .session
-        .notify_leader_delivery_exhausted(&ctx.slot_id, failure.exhausted_message_ids.len(), classification)
+        .notify_leader_delivery_exhausted(
+            &ctx.slot_id,
+            failure.exhausted_message_ids.len(),
+            classification,
+            error_code,
+        )
         .await
     {
         warn!(
