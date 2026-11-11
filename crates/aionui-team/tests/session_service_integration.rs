@@ -1004,6 +1004,9 @@ impl ITeamRepository for FullMockTeamRepo {
         if let Some(ref lead_id) = params.lead_agent_id {
             team.lead_agent_id = Some(lead_id.clone());
         }
+        if let Some(ref session_mode) = params.session_mode {
+            team.session_mode = Some(session_mode.clone());
+        }
         team.updated_at = aionui_common::now_ms();
         Ok(())
     }
@@ -7337,6 +7340,157 @@ async fn direct_cli_ensure_session_persists_team_mcp_stdio_config_for_every_desc
             .await
             .unwrap_or_else(|error| panic!("{backend} Team session ensure failed: {error}"));
     }
+}
+
+fn ask_mode_metadata_repo() -> Arc<dyn IAgentMetadataRepository> {
+    let mut claude = acp_agent_metadata_row("claude-id", "claude", Some("bypassPermissions"));
+    claude.available_modes = Some(
+        serde_json::json!({ "available_modes": [{ "id": "default" }, { "id": "bypassPermissions" }] }).to_string(),
+    );
+    let mut codex = acp_agent_metadata_row("codex-id", "codex", Some("agent-full-access"));
+    codex.available_modes = Some(
+        serde_json::json!({
+            "available_modes": [{ "id": "read-only" }, { "id": "auto" }, { "id": "agent-full-access" }]
+        })
+        .to_string(),
+    );
+    Arc::new(StubAgentMetadataRepo::with_rows(vec![claude, codex]))
+}
+
+fn claude_lead_codex_teammate_input() -> Vec<TeamAgentInput> {
+    vec![
+        TeamAgentInput {
+            name: "Lead".into(),
+            role: "lead".into(),
+            backend: Some("claude".into()),
+            model: "claude".into(),
+            assistant_id: None,
+            conversation_id: None,
+        },
+        TeamAgentInput {
+            name: "Worker".into(),
+            role: "teammate".into(),
+            backend: Some("codex".into()),
+            model: "codex".into(),
+            assistant_id: None,
+            conversation_id: None,
+        },
+    ]
+}
+
+fn session_mode_seed(conv_repo: &MockConversationRepo, conversation_id: &str) -> Option<String> {
+    conv_repo.get_extra(conversation_id).and_then(|extra| {
+        extra
+            .get("session_mode")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    })
+}
+
+#[tokio::test]
+async fn team_ask_modes_survive_member_runtime_rebuilds() {
+    let (svc, _tm, conv_repo) =
+        setup_with_factory_and_metadata_and_conversation_repo(success_factory(), ask_mode_metadata_repo());
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Ask first".into(),
+                agents: claude_lead_codex_teammate_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    let lead = created.assistants.iter().find(|a| a.role == "lead").unwrap().clone();
+    let worker = created
+        .assistants
+        .iter()
+        .find(|a| a.role == "teammate")
+        .unwrap()
+        .clone();
+
+    // A mixed team is put in ask-first mode with one call per native id; each
+    // member takes only the id it advertises.
+    svc.set_session_mode("user1", &created.id, "default").await.unwrap();
+    svc.set_session_mode("user1", &created.id, "read-only").await.unwrap();
+    assert_eq!(
+        session_mode_seed(&conv_repo, &lead.conversation_id).as_deref(),
+        Some("default")
+    );
+    assert_eq!(
+        session_mode_seed(&conv_repo, &worker.conversation_id).as_deref(),
+        Some("read-only")
+    );
+
+    // Starting the session rebuilds the lead runtime (kill + warmup).
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    assert_eq!(
+        session_mode_seed(&conv_repo, &lead.conversation_id).as_deref(),
+        Some("default"),
+        "the lead must keep its ask-first seed when its runtime starts"
+    );
+
+    // An explicit runtime restart is another full rebuild.
+    svc.restart_agent_runtime("user1", &created.id, &lead.slot_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        session_mode_seed(&conv_repo, &lead.conversation_id).as_deref(),
+        Some("default"),
+        "a runtime restart must not reset the lead to full auto"
+    );
+
+    // The teammate attaches lazily; its rebuild applies the Team mode it advertises.
+    svc.attach_agent_runtime("user1", &created.id, &worker.slot_id)
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !conv_repo.get_extra(&worker.conversation_id).is_some_and(|extra| {
+            extra
+                .get("team_mcp_stdio_config")
+                .is_some_and(serde_json::Value::is_object)
+        }) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("teammate attach must persist its runtime config");
+    assert_eq!(
+        session_mode_seed(&conv_repo, &worker.conversation_id).as_deref(),
+        Some("read-only"),
+        "the teammate must keep its ask-first seed when its runtime attaches"
+    );
+}
+
+#[tokio::test]
+async fn team_without_a_chosen_mode_still_reseeds_full_auto_on_attach() {
+    let (svc, _tm, conv_repo) =
+        setup_with_factory_and_metadata_and_conversation_repo(success_factory(), ask_mode_metadata_repo());
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "No mode".into(),
+                agents: claude_lead_codex_teammate_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    let lead = created.assistants.iter().find(|a| a.role == "lead").unwrap().clone();
+    // A member-level seed that no Team choice backs.
+    conv_repo
+        .patch_extra(&lead.conversation_id, serde_json::json!({ "session_mode": "default" }))
+        .unwrap();
+
+    svc.ensure_session("user1", &created.id).await.unwrap();
+
+    assert_eq!(
+        session_mode_seed(&conv_repo, &lead.conversation_id).as_deref(),
+        Some("bypassPermissions"),
+        "with no Team mode, attach keeps the historical full-auto seed"
+    );
 }
 
 #[tokio::test]

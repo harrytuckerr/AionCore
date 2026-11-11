@@ -17,7 +17,7 @@ use crate::ports::TeamConversationBindingLookup;
 use crate::ports::{TeamAssistantCatalogPort, TeamToolCapabilityPort};
 use crate::service::inherit_team_workspace;
 use crate::service::spawn_support::{
-    agent_type_for_backend, cli_backend_metadata, inherited_team_mode_for_backend, session_mode_for_backend,
+    agent_type_for_backend, cli_backend_metadata, inherited_team_mode_for_backend, team_mode_for_backend,
 };
 use crate::types::{Team, TeamAgent, TeammateRole};
 use crate::workspace::TeamWorkspaceResolver;
@@ -516,13 +516,19 @@ impl TeamAgentProvisioner {
             .conversation_port
             .resolve_conversation_mcp_snapshot(user_id, &agent.conversation_id, agent.assistant_id.as_deref())
             .await?;
+        // A non-killing attach (context reset) keeps the persisted seed as-is.
+        let session_mode_seed = if kill_existing {
+            self.attach_session_mode_seed(user_id, &team_id, agent).await?
+        } else {
+            None
+        };
         match transport {
             TeamToolTransport::Mcp => {
-                self.write_team_mcp_runtime_config(user_id, agent, mcp_stdio_cfg, !kill_existing, &mcp_resolution)
+                self.write_team_mcp_runtime_config(agent, mcp_stdio_cfg, session_mode_seed.as_deref(), &mcp_resolution)
                     .await?
             }
             TeamToolTransport::CliAssumed => {
-                self.write_team_cli_runtime_config(user_id, agent, !kill_existing, &mcp_resolution)
+                self.write_team_cli_runtime_config(agent, session_mode_seed.as_deref(), &mcp_resolution)
                     .await?
             }
         }
@@ -543,6 +549,7 @@ impl TeamAgentProvisioner {
             conversation_id = %agent.conversation_id,
             backend = %agent.backend,
             transport = ?transport,
+            session_mode_seed = session_mode_seed.as_deref().unwrap_or("<kept>"),
             outcome = "attached",
             "Team agent provisioner attached runtime process"
         );
@@ -621,25 +628,52 @@ impl TeamAgentProvisioner {
         )))
     }
 
-    pub(crate) async fn write_team_mcp_runtime_config(
+    /// The session-mode seed a member runtime is rebuilt with.
+    ///
+    /// The Team row stores the owner's semantic choice (`full_auto` or a native
+    /// mode id); it is translated for this member exactly as for a new member:
+    /// `full_auto` becomes the member's own full-auto id, and a native id is
+    /// used only when this member advertises it. When the member does not
+    /// advertise the Team's native id, `None` is returned so the member keeps
+    /// the seed `set_session_mode` (or creation) already persisted for it —
+    /// that is how a mixed team keeps one ask-first id per backend.
+    ///
+    /// A Team with no chosen mode keeps the historical behaviour: members are
+    /// (re)seeded with their full-auto id on every attach.
+    async fn attach_session_mode_seed(
         &self,
         user_id: &str,
+        team_id: &str,
         agent: &TeamAgent,
-        mcp_stdio_cfg: TeamMcpStdioConfig,
-        preserve_session_mode: bool,
-        mcp_resolution: &TeamMcpSnapshotResolution,
-    ) -> Result<(), TeamError> {
+    ) -> Result<Option<String>, TeamError> {
+        let team_mode = self
+            .repo
+            .get_team(user_id, team_id)
+            .await?
+            .and_then(|row| row.session_mode);
         let cli_metadata = cli_backend_metadata(&self.agent_metadata_repo, user_id, &agent.backend).await?;
         let agent_type = agent_type_for_backend(cli_metadata.as_ref(), &agent.backend)?;
-        let session_mode = session_mode_for_backend(&agent.backend, agent_type, cli_metadata.as_ref());
-        let mut patch = if preserve_session_mode {
-            serde_json::json!({ "team_mcp_stdio_config": mcp_stdio_cfg })
-        } else {
-            serde_json::json!({
-                "team_mcp_stdio_config": mcp_stdio_cfg,
-                "session_mode": session_mode,
-            })
-        };
+        Ok(team_mode_for_backend(
+            team_mode.as_deref(),
+            &agent.backend,
+            agent_type,
+            cli_metadata.as_ref(),
+        ))
+    }
+
+    /// Persist the MCP-transport runtime config. `session_mode` is written
+    /// only when `Some`; `None` keeps the member's persisted seed.
+    pub(crate) async fn write_team_mcp_runtime_config(
+        &self,
+        agent: &TeamAgent,
+        mcp_stdio_cfg: TeamMcpStdioConfig,
+        session_mode: Option<&str>,
+        mcp_resolution: &TeamMcpSnapshotResolution,
+    ) -> Result<(), TeamError> {
+        let mut patch = serde_json::json!({ "team_mcp_stdio_config": mcp_stdio_cfg });
+        if let Some(session_mode) = session_mode {
+            patch["session_mode"] = serde_json::Value::String(session_mode.to_owned());
+        }
         merge_mcp_snapshot_into_patch(&mut patch, mcp_resolution);
         self.conversation_port
             .patch_runtime_config(&agent.conversation_id, patch)
@@ -652,24 +686,18 @@ impl TeamAgentProvisioner {
             })
     }
 
+    /// Persist the CLI-transport runtime config. `session_mode` is written
+    /// only when `Some`; `None` keeps the member's persisted seed.
     pub(crate) async fn write_team_cli_runtime_config(
         &self,
-        user_id: &str,
         agent: &TeamAgent,
-        preserve_session_mode: bool,
+        session_mode: Option<&str>,
         mcp_resolution: &TeamMcpSnapshotResolution,
     ) -> Result<(), TeamError> {
-        let cli_metadata = cli_backend_metadata(&self.agent_metadata_repo, user_id, &agent.backend).await?;
-        let agent_type = agent_type_for_backend(cli_metadata.as_ref(), &agent.backend)?;
-        let session_mode = session_mode_for_backend(&agent.backend, agent_type, cli_metadata.as_ref());
-        let mut patch = if preserve_session_mode {
-            serde_json::json!({ "team_mcp_stdio_config": null })
-        } else {
-            serde_json::json!({
-                "team_mcp_stdio_config": null,
-                "session_mode": session_mode,
-            })
-        };
+        let mut patch = serde_json::json!({ "team_mcp_stdio_config": null });
+        if let Some(session_mode) = session_mode {
+            patch["session_mode"] = serde_json::Value::String(session_mode.to_owned());
+        }
         merge_mcp_snapshot_into_patch(&mut patch, mcp_resolution);
         self.conversation_port
             .patch_runtime_config(&agent.conversation_id, patch)
@@ -1514,7 +1542,7 @@ mod tests {
         let provisioner = test_provisioner_with_patches(events, Arc::clone(&patches));
 
         provisioner
-            .write_team_cli_runtime_config("user-test", &test_agent(), false, &TeamMcpSnapshotResolution::default())
+            .write_team_cli_runtime_config(&test_agent(), None, &TeamMcpSnapshotResolution::default())
             .await
             .unwrap();
 
