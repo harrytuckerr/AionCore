@@ -61,7 +61,7 @@ use crate::session::{
     spawn_attach_agent_process_bg,
 };
 use crate::team_run::TeamRunManager;
-use crate::types::{Team, TeamAgent, TeamTask, TeammateRole};
+use crate::types::{Team, TeamAgent, TeamTask, TeammateRole, require_assistant_allowed};
 use crate::work_coordinator::{
     McpRefreshDisposition, ObserveMessagesResult, RuntimeConstraint, RuntimeRestartRejection,
 };
@@ -789,7 +789,13 @@ impl TeamSessionService {
 
         let provisioned = self
             .provisioner()
-            .provision_initial_agents(user_id, &team_id, &req.agents, shared_workspace.as_deref())
+            .provision_initial_agents(
+                user_id,
+                &team_id,
+                &req.agents,
+                shared_workspace.as_deref(),
+                req.allowed_assistant_ids.as_deref(),
+            )
             .await?;
         let agents = provisioned.agents;
         let lead_agent_id = provisioned.lead_agent_id;
@@ -806,6 +812,11 @@ impl TeamSessionService {
             workspace: team_workspace.clone(),
             workspace_mode: "shared".into(),
             agents: agents_json,
+            allowed_assistant_ids: req
+                .allowed_assistant_ids
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
             lead_agent_id: lead_agent_id.clone(),
             session_mode: None,
             agents_version: "1.0.1".into(),
@@ -821,6 +832,7 @@ impl TeamSessionService {
             name: req.name,
             workspace: team_workspace,
             agents,
+            allowed_assistant_ids: req.allowed_assistant_ids,
             lead_agent_id,
             created_at: now,
             updated_at: now,
@@ -854,7 +866,7 @@ impl TeamSessionService {
                     }
                 },
                 Err(e) => {
-                    tracing::warn!(team_id = %row.id, error = %e, "skipping team with invalid agents JSON");
+                    tracing::warn!(team_id = %row.id, error = %e, "skipping team with invalid stored team JSON");
                 }
             }
         }
@@ -1203,6 +1215,8 @@ impl TeamSessionService {
             .find(|agent| agent.slot_id == slot_id)
             .cloned()
             .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))?;
+        self.require_member_assistant_access(team.allowed_assistant_ids.as_deref(), &target)
+            .await?;
         // A single-member team has no other member to promote; this edge wins
         // over the already-lead no-op.
         if team.agents.len() < 2 {
@@ -1653,6 +1667,28 @@ impl TeamSessionService {
     /// 4. Only insert into `sessions` after every step above succeeds — on
     ///    any failure, stop the session and leave the map untouched so a
     ///    retry can start cleanly.
+    pub(crate) async fn require_member_assistant_access(
+        &self,
+        allowed_assistant_ids: Option<&[String]>,
+        member: &TeamAgent,
+    ) -> Result<(), TeamError> {
+        let Some(ids) = allowed_assistant_ids else {
+            return Ok(());
+        };
+        require_assistant_allowed(Some(ids), member.assistant_id.as_deref())?;
+        // Runtime lookup uses the conversation binding, not the roster record.
+        let actual = self
+            .conversation_port
+            .conversation_assistant_id(&member.conversation_id)
+            .await?;
+        if actual != member.assistant_id {
+            return Err(TeamError::Forbidden(
+                "Team member's assistant binding does not match its roster entry".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn ensure_session(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
         self.load_owned_team_row(user_id, team_id).await?;
         self.ensure_session_inner(team_id, Some(user_id)).await
@@ -1699,6 +1735,9 @@ impl TeamSessionService {
         };
         let user_id = row.user_id.clone();
         let mut team = Team::from_row(&row)?;
+        for member in &team.agents {
+            require_assistant_allowed(team.allowed_assistant_ids.as_deref(), member.assistant_id.as_deref())?;
+        }
         self.reconcile_legacy_team_models(&user_id, team_id, &mut team).await?;
         let agents_snapshot: Vec<TeamAgent> = team.agents.clone();
 
@@ -3862,6 +3901,7 @@ mod tests {
 
     fn two_agent_team_request(name: &str) -> aionui_api_types::CreateTeamRequest {
         aionui_api_types::CreateTeamRequest {
+            allowed_assistant_ids: None,
             name: name.into(),
             agents: vec![
                 aionui_api_types::TeamAgentInput {
@@ -5447,6 +5487,7 @@ mod tests {
                 .create_team(
                     "user-test",
                     aionui_api_types::CreateTeamRequest {
+                        allowed_assistant_ids: None,
                         name: format!("{lead_backend} mode propagation"),
                         agents: vec![
                             aionui_api_types::TeamAgentInput {

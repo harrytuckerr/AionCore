@@ -4,6 +4,8 @@ use aionui_api_types::{TeamAgentResponse, TeamContextResetAvailability, TeamCont
 use aionui_common::TimestampMs;
 use serde::{Deserialize, Serialize};
 
+use crate::error::TeamError;
+
 // ---------------------------------------------------------------------------
 // TeammateRole
 // ---------------------------------------------------------------------------
@@ -159,6 +161,8 @@ pub struct Team {
     pub name: String,
     pub workspace: String,
     pub agents: Vec<TeamAgent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_assistant_ids: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lead_agent_id: Option<String>,
     pub created_at: TimestampMs,
@@ -291,6 +295,11 @@ impl Team {
             name: row.name.clone(),
             workspace: row.workspace.clone(),
             agents,
+            allowed_assistant_ids: row
+                .allowed_assistant_ids
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()?,
             lead_agent_id: row.lead_agent_id.clone(),
             created_at: row.created_at,
             updated_at: row.updated_at,
@@ -304,10 +313,23 @@ impl Team {
             workspace: self.workspace.clone(),
             assistants: self.agents.iter().map(|a| a.to_response()).collect(),
             leader_assistant_id: self.lead_agent_id.clone(),
+            allowed_assistant_ids: self.allowed_assistant_ids.clone(),
             created_at: self.created_at,
             updated_at: self.updated_at,
         }
     }
+}
+
+pub(crate) fn require_assistant_allowed(
+    allowed_assistant_ids: Option<&[String]>,
+    assistant_id: Option<&str>,
+) -> Result<(), TeamError> {
+    if let Some(ids) = allowed_assistant_ids
+        && !assistant_id.is_some_and(|id| !id.is_empty() && ids.iter().any(|allowed| allowed == id))
+    {
+        return Err(TeamError::Forbidden("Assistant is not allowed for this team".into()));
+    }
+    Ok(())
 }
 
 impl MailboxMessage {
@@ -643,6 +665,7 @@ mod tests {
         }])
         .unwrap();
         let row = TeamRow {
+            allowed_assistant_ids: None,
             id: "t1".into(),
             user_id: "system_default_user".into(),
             name: "Alpha".into(),
@@ -667,6 +690,7 @@ mod tests {
     #[test]
     fn team_to_response() {
         let team = Team {
+            allowed_assistant_ids: None,
             id: "t1".into(),
             name: "Alpha".into(),
             workspace: "/workspace/team".into(),
@@ -699,6 +723,7 @@ mod tests {
     #[test]
     fn team_from_row_invalid_json() {
         let row = TeamRow {
+            allowed_assistant_ids: None,
             id: "t1".into(),
             user_id: "system_default_user".into(),
             name: "Bad".into(),

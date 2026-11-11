@@ -370,6 +370,17 @@ impl TeamSession {
         service.provisioner().team_tool_transport(&self.user_id, agent).await
     }
 
+    async fn require_member_assistant_access(&self, member: &TeamAgent) -> Result<(), TeamError> {
+        let Some(ids) = self.team.allowed_assistant_ids.as_deref() else {
+            return Ok(());
+        };
+        let service = self
+            .service
+            .upgrade()
+            .ok_or_else(|| TeamError::SessionNotFound(self.team.id.clone()))?;
+        service.require_member_assistant_access(Some(ids), member).await
+    }
+
     pub(crate) async fn prepare_next_batch(&self, slot_id: &str) -> Result<PrepareBatchResult, TeamError> {
         if self.start_pending_mcp_refresh(slot_id) {
             return Ok(PrepareBatchResult::Blocked);
@@ -430,6 +441,22 @@ impl TeamSession {
                         return Err(error);
                     }
                 };
+                if let Err(error) = self.require_member_assistant_access(&agent).await {
+                    let update = self.work_coordinator.set_runtime_constraint(
+                        slot_id,
+                        RuntimeConstraint::Failed {
+                            operation_id: 0,
+                            classification: "assistant_access_denied",
+                        },
+                    );
+                    // Preserve background mail but do not keep waking this slot
+                    // until someone explicitly intervenes or rebuilds the session.
+                    self.work_coordinator.pause_slot(slot_id);
+                    self.mailbox
+                        .mark_read_batch(&self.team.id, &update.terminal_message_ids)
+                        .await?;
+                    return Err(error);
+                }
                 let claimed_rows = match self
                     .mailbox
                     .peek_unread_by_ids(&self.team.id, slot_id, &batch.mailbox_message_ids)
@@ -2516,14 +2543,18 @@ async fn attach_member_runtime_inner(
         "team member runtime attach started"
     );
 
-    let attach_result = TeamSession::attach_spawned_agent_process(
-        &service,
-        &agent,
-        session.mcp_stdio_config(&agent.slot_id),
-        &user_id,
-        &task_manager,
-        kill_existing,
-    )
+    let attach_result = async {
+        session.require_member_assistant_access(&agent).await?;
+        TeamSession::attach_spawned_agent_process(
+            &service,
+            &agent,
+            session.mcp_stdio_config(&agent.slot_id),
+            &user_id,
+            &task_manager,
+            kill_existing,
+        )
+        .await
+    }
     .await;
     let mcp_fingerprint = attach_result.as_ref().ok().and_then(|value| value.clone());
     if let Err(error) = attach_result {
@@ -3033,6 +3064,7 @@ mod tests {
 
     fn make_team() -> Team {
         Team {
+            allowed_assistant_ids: None,
             id: "t1".into(),
             name: "Test Team".into(),
             workspace: "/tmp/test-team".into(),

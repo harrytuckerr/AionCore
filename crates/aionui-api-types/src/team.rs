@@ -108,6 +108,9 @@ pub struct CreateTeamRequest {
     pub agents: Vec<TeamAgentInput>,
     #[serde(default)]
     pub workspace: Option<String>,
+    /// Immutable assistant catalog IDs. Omitted or null keeps the team unrestricted.
+    #[serde(default)]
+    pub allowed_assistant_ids: Option<Vec<String>>,
 }
 
 /// Request body for `PATCH /api/teams/:id/name`.
@@ -603,6 +606,8 @@ pub struct TeamResponse {
     pub assistants: Vec<TeamAgentResponse>,
     #[serde(skip_serializing_if = "Option::is_none", alias = "lead_agent_id")]
     pub leader_assistant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_assistant_ids: Option<Vec<String>>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
 }

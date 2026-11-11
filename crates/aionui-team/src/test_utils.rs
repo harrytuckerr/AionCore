@@ -54,6 +54,7 @@ impl ITeamRepository for MockTeamRepo {
     }
     async fn get_team_for_restore(&self, _id: &str) -> Result<Option<TeamRow>, DbError> {
         Ok(Some(TeamRow {
+            allowed_assistant_ids: None,
             id: _id.to_owned(),
             user_id: "system_default_user".to_owned(),
             name: "mock".to_owned(),
@@ -1848,6 +1849,7 @@ pub(crate) mod workspace_harness {
 
     pub(crate) fn single_agent_team_request(name: &str) -> CreateTeamRequest {
         CreateTeamRequest {
+            allowed_assistant_ids: None,
             name: name.into(),
             agents: vec![aionui_api_types::TeamAgentInput {
                 name: "Lead".into(),

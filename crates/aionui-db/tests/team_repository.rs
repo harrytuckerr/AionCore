@@ -33,6 +33,7 @@ fn make_team(id: &str, name: &str) -> TeamRow {
 fn make_team_for_user(id: &str, user_id: &str, name: &str) -> TeamRow {
     let now = now_ms();
     TeamRow {
+        allowed_assistant_ids: None,
         id: id.into(),
         user_id: user_id.into(),
         name: name.into(),
@@ -99,6 +100,33 @@ async fn create_and_get_team() {
     assert_eq!(fetched.id, "t1");
     assert_eq!(fetched.name, "Team Alpha");
     assert_eq!(fetched.lead_agent_id, Some("a1".into()));
+}
+
+#[tokio::test]
+async fn allowed_assistant_ids_survive_other_team_updates() {
+    let (repo, _db) = repo().await;
+    for (id, policy) in [
+        ("legacy", None),
+        ("empty", Some("[]")),
+        ("restricted", Some(r#"["assistant-a"]"#)),
+    ] {
+        let mut row = make_team(id, "Before");
+        row.allowed_assistant_ids = policy.map(str::to_owned);
+        repo.create_team(&row).await.unwrap();
+        repo.update_team(
+            DEFAULT_USER_ID,
+            id,
+            &UpdateTeamParams {
+                name: Some("After".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let restored = repo.get_team_for_restore(id).await.unwrap().unwrap();
+        assert_eq!(restored.name, "After");
+        assert_eq!(restored.allowed_assistant_ids.as_deref(), policy);
+    }
 }
 
 #[tokio::test]

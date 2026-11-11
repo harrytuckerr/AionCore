@@ -19,7 +19,7 @@ use crate::service::inherit_team_workspace;
 use crate::service::spawn_support::{
     agent_type_for_backend, cli_backend_metadata, inherited_team_mode_for_backend, team_mode_for_backend,
 };
-use crate::types::{Team, TeamAgent, TeammateRole};
+use crate::types::{Team, TeamAgent, TeammateRole, require_assistant_allowed};
 use crate::workspace::TeamWorkspaceResolver;
 
 #[derive(Clone)]
@@ -248,6 +248,7 @@ impl TeamAgentProvisioner {
         team_id: &str,
         inputs: &[TeamAgentInput],
         shared_workspace: Option<&str>,
+        allowed_assistant_ids: Option<&[String]>,
     ) -> Result<InitialProvisioningResult, TeamError> {
         if inputs.is_empty() {
             return Err(TeamError::InvalidRequest("at least one agent is required".into()));
@@ -267,6 +268,13 @@ impl TeamAgentProvisioner {
                 "exactly one team agent must have role lead".into(),
             ));
         };
+
+        // Reject an out-of-policy roster before provisioning any conversation.
+        if let Some(ids) = allowed_assistant_ids {
+            for input in inputs {
+                require_assistant_allowed(Some(ids), input.assistant_id.as_deref().map(str::trim))?;
+            }
+        }
 
         let leader_input = &inputs[*leader_idx];
         let leader_slot_id = generate_id();
@@ -400,8 +408,9 @@ impl TeamAgentProvisioner {
                 "add_agent only supports teammate role".into(),
             ));
         }
-        let workspace = self.workspace_resolver().resolve_for_new_agent(row, team).await?;
         let assistant_id = Self::effective_assistant_id(req.assistant_id.as_deref());
+        require_assistant_allowed(team.allowed_assistant_ids.as_deref(), assistant_id.as_deref())?;
+        let workspace = self.workspace_resolver().resolve_for_new_agent(row, team).await?;
         let backend = self
             .resolve_requested_backend(user_id, req.backend.as_deref(), assistant_id.as_deref())
             .await?;
@@ -464,6 +473,7 @@ impl TeamAgentProvisioner {
             .await?
             .ok_or_else(|| TeamError::TeamNotFound(req.team_id.clone()))?;
         let mut team = Team::from_row(&row)?;
+        require_assistant_allowed(team.allowed_assistant_ids.as_deref(), req.assistant_id.as_deref())?;
         let workspace = self.workspace_resolver().resolve_for_new_agent(&row, &team).await?;
         // Resolve the global MCP selection once for this spawned agent.
         let mcp_selection = self
@@ -1791,7 +1801,7 @@ mod tests {
         }];
 
         let error = match provisioner
-            .provision_initial_agents("user-1", "team-1", &inputs, Some("/workspace"))
+            .provision_initial_agents("user-1", "team-1", &inputs, Some("/workspace"), None)
             .await
         {
             Err(error) => error,

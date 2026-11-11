@@ -13,6 +13,8 @@ pub struct TeamRow {
     pub workspace_mode: String,
     /// JSON array: serialized `TeamAgent[]`.
     pub agents: String,
+    /// Immutable JSON array of assistant catalog IDs; SQL NULL means unrestricted.
+    pub allowed_assistant_ids: Option<String>,
     pub lead_agent_id: Option<String>,
     pub session_mode: Option<String>,
     pub agents_version: String,
@@ -75,6 +77,7 @@ mod tests {
     #[test]
     fn team_row_default_agents_is_empty_json_array() {
         let row = TeamRow {
+            allowed_assistant_ids: None,
             id: "t1".into(),
             user_id: "system_default_user".into(),
             name: "Team".into(),
