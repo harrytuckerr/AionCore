@@ -86,6 +86,12 @@ pub struct TerminalRegistry {
     /// aioncore process's cwd (the app bundle), which is never what the
     /// agent means.
     default_cwd: Option<std::path::PathBuf>,
+    /// Environment every command starts with, before the agent-supplied
+    /// `env`: the owning conversation's runtime context (`AIONUI_*`), the
+    /// same set the agent process itself was launched with. A delegated
+    /// command (for example the Team helper CLI) needs it exactly as a
+    /// command the agent ran itself would have it. Empty for probes.
+    base_env: Vec<(String, String)>,
 }
 
 impl TerminalRegistry {
@@ -95,6 +101,12 @@ impl TerminalRegistry {
             default_cwd,
             ..Self::default()
         }
+    }
+
+    /// Set the environment every command of this registry starts with.
+    pub fn with_base_env(mut self, base_env: Vec<(String, String)>) -> Self {
+        self.base_env = base_env;
+        self
     }
 }
 
@@ -140,7 +152,8 @@ impl TerminalRegistry {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        for (k, v) in &params.env {
+        // Agent-supplied env is applied last so it can still override.
+        for (k, v) in self.base_env.iter().chain(&params.env) {
             builder.env(k, v);
         }
         if let Some(cwd) = params.cwd.as_ref().or(self.default_cwd.as_ref()) {
@@ -407,6 +420,26 @@ mod tests {
         assert!(snap.output.contains("hello_term"));
         assert!(!snap.truncated);
         assert!(snap.exit.is_some());
+    }
+
+    #[tokio::test]
+    async fn create_applies_base_env_before_agent_env() {
+        let reg = TerminalRegistry::new("conv-t", None).with_base_env(vec![
+            ("AIONUI_CONVERSATION_ID".into(), "conv-t".into()),
+            ("AIONUI_TERMINAL_TEST_OVERRIDE".into(), "base".into()),
+        ]);
+        let mut p = params(
+            "sh",
+            &[
+                "-c",
+                "printf '%s|%s' \"$AIONUI_CONVERSATION_ID\" \"$AIONUI_TERMINAL_TEST_OVERRIDE\"",
+            ],
+        );
+        p.env = vec![("AIONUI_TERMINAL_TEST_OVERRIDE".into(), "agent".into())];
+        let id = reg.create(p).await.unwrap();
+        reg.wait_for_exit(&id).await.unwrap();
+        let snap = wait_for_output_contains(&reg, &id, "conv-t|").await;
+        assert_eq!(snap.output, "conv-t|agent");
     }
 
     #[tokio::test]

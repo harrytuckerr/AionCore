@@ -34,6 +34,11 @@ pub struct AcpSessionParams {
     pub data_dir: PathBuf,
     /// Whether prompt diagnostics should be dumped under `data_dir/prompt-dumps`.
     pub dump_prompts: bool,
+    /// The conversation runtime context env (`AIONUI_*`). The agent process
+    /// already gets it through `command_spec.env`; this copy seeds the
+    /// client-hosted terminals so commands the agent delegates to us
+    /// (`terminal/create`) see the same variables.
+    pub runtime_env: Vec<(String, String)>,
 }
 
 impl AcpSessionParams {
@@ -69,6 +74,7 @@ pub async fn assemble_acp_params(
     session_snapshot: Option<PersistedSessionState>,
     data_dir: PathBuf,
     dump_prompts: bool,
+    runtime_env: Vec<(String, String)>,
 ) -> AcpSessionParams {
     let mcp_servers = resolve_mcp_servers(&config, user_mcp_servers);
     let preset_context = compose_preset_context(config.preset_context.as_deref());
@@ -85,6 +91,7 @@ pub async fn assemble_acp_params(
         session_snapshot,
         data_dir,
         dump_prompts,
+        runtime_env,
     }
 }
 
@@ -216,6 +223,7 @@ mod tests {
             None,
             PathBuf::from("/tmp/data"),
             true,
+            Vec::new(),
         )
         .await;
 
@@ -227,6 +235,34 @@ mod tests {
             Some(&["mcp-docs".to_owned()][..])
         );
         assert_eq!(params.mcp_servers.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn assemble_acp_params_keeps_runtime_env_for_client_terminals() {
+        let runtime_env = vec![
+            ("AIONUI_CONVERSATION_ID".to_owned(), "conv-1".to_owned()),
+            ("AIONUI_HELPER_BIN".to_owned(), "/tmp/aioncore".to_owned()),
+        ];
+
+        let params = assemble_acp_params(
+            "conv-1".into(),
+            "user-1".into(),
+            WorkspaceInfo {
+                path: "/tmp/workspace".into(),
+                is_custom: false,
+            },
+            test_metadata(),
+            CommandSpec::default(),
+            AcpBuildExtra::default(),
+            Vec::new(),
+            None,
+            PathBuf::from("/tmp/data"),
+            false,
+            runtime_env.clone(),
+        )
+        .await;
+
+        assert_eq!(params.runtime_env, runtime_env);
     }
 
     #[test]
@@ -298,6 +334,7 @@ mod tests {
             None,
             PathBuf::from("/tmp/data"),
             false,
+            Vec::new(),
         )
         .await;
 

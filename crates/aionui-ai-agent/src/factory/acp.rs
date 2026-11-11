@@ -281,6 +281,7 @@ pub(super) async fn build(
             session_snapshot,
             deps.data_dir.clone(),
             deps.dump_prompts,
+            ctx.runtime_env.clone(),
         )
         .await,
     );
