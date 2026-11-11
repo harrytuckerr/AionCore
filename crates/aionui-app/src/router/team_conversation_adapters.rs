@@ -490,6 +490,17 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             .map(str::to_owned))
     }
 
+    async fn conversation_agent_id(&self, conversation_id: &str) -> Result<Option<String>, TeamError> {
+        let Some(user_id) = self.owner_user_id(conversation_id).await? else {
+            return Ok(None);
+        };
+        let Some(row) = self.conversation_repo.get(&user_id, conversation_id).await? else {
+            return Ok(None);
+        };
+        let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
+        Ok(extra_agent_id(&extra))
+    }
+
     async fn conversation_assistant_id(&self, conversation_id: &str) -> Result<Option<String>, TeamError> {
         let Some(user_id) = self.owner_user_id(conversation_id).await? else {
             return Ok(None);
@@ -762,9 +773,31 @@ fn map_conversation_turn_error(error: ConversationError) -> AgentTurnExecutionEr
     }
 }
 
+/// The agent catalog id persisted in a conversation's `extra.agent_id` (written
+/// from the assistant snapshot at creation and consumed by the ACP factory).
+fn extra_agent_id(extra: &serde_json::Value) -> Option<String> {
+    extra
+        .get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extra_agent_id_reads_the_persisted_agent_identity() {
+        assert_eq!(
+            extra_agent_id(&serde_json::json!({ "backend": "acp", "agent_id": "13226fc9" })).as_deref(),
+            Some("13226fc9")
+        );
+        assert_eq!(extra_agent_id(&serde_json::json!({ "agent_id": "  " })), None);
+        assert_eq!(extra_agent_id(&serde_json::json!({ "agent_id": 42 })), None);
+        assert_eq!(extra_agent_id(&serde_json::json!({ "backend": "acp" })), None);
+    }
 
     #[test]
     fn parse_available_command_names_extracts_names() {

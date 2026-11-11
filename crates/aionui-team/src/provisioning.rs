@@ -104,6 +104,14 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
 
     async fn conversation_assistant_id(&self, conversation_id: &str) -> Result<Option<String>, TeamError>;
 
+    /// The agent catalog id the member conversation runs, when one is
+    /// recorded. Several agents can share one backend label (every custom ACP
+    /// agent is `acp`), so capability lookups must use this id rather than the
+    /// label alone.
+    async fn conversation_agent_id(&self, _conversation_id: &str) -> Result<Option<String>, TeamError> {
+        Ok(None)
+    }
+
     async fn create_team_temp_workspace(&self, user_id: &str, team_id: &str) -> Result<String, TeamError>;
 
     async fn patch_runtime_config(&self, conversation_id: &str, patch: serde_json::Value) -> Result<(), TeamError>;
@@ -615,7 +623,16 @@ impl TeamAgentProvisioner {
         user_id: &str,
         agent: &TeamAgent,
     ) -> Result<(TeamToolTransport, aionui_common::ResolvedBackendCapabilities), TeamError> {
-        let capabilities = self.capability_port.resolve(user_id, &agent.backend, None).await?;
+        // Resolve by the member's own agent id: the backend label alone is
+        // ambiguous for custom ACP agents and picks another agent's row.
+        let agent_id = self
+            .conversation_port
+            .conversation_agent_id(&agent.conversation_id)
+            .await?;
+        let capabilities = self
+            .capability_port
+            .resolve(user_id, &agent.backend, agent_id.as_deref())
+            .await?;
         if capabilities.mcp.stdio {
             return Ok((TeamToolTransport::Mcp, capabilities));
         }
@@ -1022,6 +1039,7 @@ mod tests {
         mcp_snapshot: Option<McpRuntimeSnapshot>,
         mcp_error: Option<&'static str>,
         persisted_extra: Arc<Mutex<serde_json::Value>>,
+        agent_id: Option<&'static str>,
     }
 
     #[async_trait]
@@ -1081,6 +1099,10 @@ mod tests {
 
         async fn conversation_assistant_id(&self, _conversation_id: &str) -> Result<Option<String>, TeamError> {
             Ok(None)
+        }
+
+        async fn conversation_agent_id(&self, _conversation_id: &str) -> Result<Option<String>, TeamError> {
+            Ok(self.agent_id.map(str::to_owned))
         }
 
         async fn create_team_temp_workspace(&self, _user_id: &str, _team_id: &str) -> Result<String, TeamError> {
@@ -1447,9 +1469,69 @@ mod tests {
                 mcp_snapshot,
                 mcp_error,
                 persisted_extra,
+                agent_id: None,
             }),
             Arc::new(TestCapabilityPort),
         )
+    }
+
+    /// Advertises stdio MCP only for one agent id, the way two custom ACP
+    /// agents sharing the `acp` label can differ in their handshakes.
+    struct AgentIdCapabilityPort {
+        seen_agent_ids: Arc<Mutex<Vec<Option<String>>>>,
+    }
+
+    #[async_trait]
+    impl TeamToolCapabilityPort for AgentIdCapabilityPort {
+        async fn resolve(
+            &self,
+            _user_id: &str,
+            _backend: &str,
+            agent_id: Option<&str>,
+        ) -> Result<aionui_common::ResolvedBackendCapabilities, TeamError> {
+            self.seen_agent_ids.lock().unwrap().push(agent_id.map(str::to_owned));
+            Ok(aionui_common::ResolvedBackendCapabilities {
+                mcp: aionui_common::McpTransportCapabilities {
+                    stdio: agent_id == Some("custom-grok"),
+                    ..Default::default()
+                },
+                cli_fallback: true,
+                origin: aionui_common::CapabilityOrigin::AcpHandshake,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn team_tool_transport_resolves_capabilities_by_member_agent_id() {
+        let seen_agent_ids = Arc::new(Mutex::new(Vec::new()));
+        let provisioner = TeamAgentProvisioner::new(
+            Arc::new(crate::test_utils::MockTeamRepo::new()),
+            Arc::new(UnusedAgentMetadataRepo),
+            Arc::new(EmptyTeamAssistantCatalog),
+            Arc::new(EmptyProviderRepo),
+            Arc::new(RecordingProvisioningPort {
+                events: Arc::new(Mutex::new(Vec::new())),
+                patches: Arc::new(Mutex::new(Vec::new())),
+                mcp_snapshot: None,
+                mcp_error: None,
+                persisted_extra: Arc::new(Mutex::new(serde_json::json!({}))),
+                agent_id: Some("custom-grok"),
+            }),
+            Arc::new(AgentIdCapabilityPort {
+                seen_agent_ids: Arc::clone(&seen_agent_ids),
+            }),
+        );
+        let agent = test_agent();
+        assert_eq!(agent.backend, "acp", "custom ACP members carry the generic label");
+
+        let transport = provisioner.team_tool_transport("user-test", &agent).await.unwrap();
+
+        assert_eq!(transport, TeamToolTransport::Mcp);
+        assert_eq!(
+            seen_agent_ids.lock().unwrap().as_slice(),
+            [Some("custom-grok".to_owned())],
+            "the lookup must carry the member's own agent id"
+        );
     }
 
     fn test_agent() -> TeamAgent {
