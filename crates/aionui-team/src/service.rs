@@ -53,8 +53,9 @@ use crate::runtime_tools::{
     ResolvedTeamToolContext, agent_for_conversation, error_payload, execute_with_scheduler, role_to_tool_role,
 };
 use crate::service::spawn_support::{
-    agent_type_for_backend, cli_backend_metadata, config_options_advertise_mode, is_team_full_auto_mode,
-    metadata_advertises_mode, normalize_team_mode_from_lead, team_mode_for_backend,
+    agent_type_for_backend, cli_backend_metadata, config_options_advertise_mode, is_team_ask_mode,
+    is_team_full_auto_mode, is_team_semantic_mode, metadata_advertises_mode, normalize_team_mode_from_lead,
+    team_mode_for_backend,
 };
 use crate::session::{
     AgentMessageQueueResult, TeamSession, attach_member_runtime, attach_member_runtime_after_kill,
@@ -2664,13 +2665,31 @@ impl TeamSessionService {
         self.sessions.len()
     }
 
+    /// Stop the team runtime and end every member CLI process.
+    ///
+    /// Members are killed with the idle-reaper reason: the conversations and
+    /// their backend resume anchors are kept, so the next `ensure_session`
+    /// resumes them exactly as it does after an idle clean-up. Without the
+    /// kill, a stopped team left its member CLIs running, unobserved, until
+    /// the idle reaper found them.
     pub async fn stop_session(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
-        self.load_owned_team(user_id, team_id).await?;
-        self.stop_session_unchecked(team_id);
+        let team = self.load_owned_team(user_id, team_id).await?;
+        info!(
+            team_id,
+            member_count = team.agents.len(),
+            "stopping team session and member runtimes"
+        );
+        self.stop_team_runtime_and_agents(team_id, &team, AgentKillReason::IdleTimeout)
+            .await;
         Ok(())
     }
 
-    pub fn stop_sessions_for_user(&self, user_id: &str) -> usize {
+    /// Stop every live team session the user owns and end their member CLI
+    /// processes (session revocation). Every runtime is stopped before the
+    /// first await so no team dispatches another turn while members are
+    /// being killed. Members are killed with the revocation reason, the same
+    /// one the conversation service uses for the user's other runtimes.
+    pub async fn stop_sessions_for_user(&self, user_id: &str) -> usize {
         let team_ids: Vec<String> = self
             .sessions
             .iter()
@@ -2678,8 +2697,19 @@ impl TeamSessionService {
             .map(|entry| entry.key().clone())
             .collect();
         let stopped = team_ids.len();
-        for team_id in team_ids {
-            self.stop_session_unchecked(&team_id);
+        for team_id in &team_ids {
+            self.stop_session_unchecked(team_id);
+        }
+        for team_id in &team_ids {
+            match self.load_owned_team(user_id, team_id).await {
+                Ok(team) => {
+                    self.stop_team_runtime_and_agents(team_id, &team, AgentKillReason::SessionRevoked)
+                        .await;
+                }
+                Err(err) => {
+                    warn!(team_id = %team_id, error = %err, "could not load team to end member runtimes");
+                }
+            }
         }
         stopped
     }
@@ -3418,6 +3448,8 @@ impl TeamSessionService {
         // full-auto id into the semantic Team value before member mapping.
         let mode = if is_team_full_auto_mode(requested_mode) {
             crate::service::spawn_support::TEAM_FULL_AUTO_MODE.to_owned()
+        } else if is_team_ask_mode(requested_mode) {
+            crate::service::spawn_support::TEAM_ASK_MODE.to_owned()
         } else {
             let lead = team
                 .agents
@@ -3450,12 +3482,14 @@ impl TeamSessionService {
         let mut member_modes = Vec::with_capacity(team.agents.len());
         for agent in &team.agents {
             let instance = self.task_manager.get_task(&agent.conversation_id);
-            let metadata = if is_team_full_auto_mode(&mode) || instance.is_none() {
+            let metadata = if is_team_semantic_mode(&mode) || instance.is_none() {
                 cli_backend_metadata(&self.agent_metadata_repo, user_id, &agent.backend).await?
             } else {
                 None
             };
-            let member_mode = if is_team_full_auto_mode(&mode) {
+            // Semantic values (`full_auto`, `ask`) map through each member's
+            // own table; a backend with no ask mode is skipped and keeps its seed.
+            let member_mode = if is_team_semantic_mode(&mode) {
                 let agent_type = match metadata.as_ref() {
                     Some(metadata) => agent_type_for_backend(Some(metadata), &agent.backend)?,
                     None => match instance.as_ref() {
@@ -4020,7 +4054,7 @@ mod tests {
         svc.ensure_session("user-test", &owned.id).await.unwrap();
         svc.ensure_session("user-other", &other.id).await.unwrap();
 
-        assert_eq!(svc.stop_sessions_for_user("user-test"), 1);
+        assert_eq!(svc.stop_sessions_for_user("user-test").await, 1);
         assert_eq!(svc.session_count_for_test(), 1);
         assert!(!svc.session_has_slow_monitor(&owned.id));
         assert!(svc.session_has_slow_monitor(&other.id));

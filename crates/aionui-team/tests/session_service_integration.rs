@@ -7179,6 +7179,88 @@ async fn ss1_stop_session() {
 }
 
 #[tokio::test]
+async fn ss2_stop_session_ends_member_processes_but_keeps_conversations() {
+    let (svc, tm, conv_repo) = setup_with_factory_and_metadata_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                allowed_assistant_ids: None,
+                name: "Stop kills".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    tm.reset_calls();
+
+    svc.stop_session("user1", &created.id).await.unwrap();
+
+    let calls = tm.snapshot();
+    for agent in &created.assistants {
+        assert!(
+            calls
+                .kill
+                .iter()
+                .any(|(id, reason)| id == &agent.conversation_id && *reason == Some(AgentKillReason::IdleTimeout)),
+            "stop_session must end member {} with the resumable idle reason: {:?}",
+            agent.slot_id,
+            calls.kill
+        );
+        assert!(
+            conv_repo.get_extra(&agent.conversation_id).is_some(),
+            "stopping a session must keep the member conversation"
+        );
+    }
+}
+
+#[tokio::test]
+async fn ss2b_stop_sessions_for_user_ends_member_processes() {
+    let (svc, tm, conv_repo) = setup_with_factory_and_metadata_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                allowed_assistant_ids: None,
+                name: "Revoke kills".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    tm.reset_calls();
+
+    assert_eq!(svc.stop_sessions_for_user("user1").await, 1);
+
+    let calls = tm.snapshot();
+    for agent in &created.assistants {
+        assert!(
+            calls
+                .kill
+                .iter()
+                .any(|(id, reason)| id == &agent.conversation_id && *reason == Some(AgentKillReason::SessionRevoked)),
+            "stop_sessions_for_user must end member {} with the revocation reason: {:?}",
+            agent.slot_id,
+            calls.kill
+        );
+        assert!(
+            conv_repo.get_extra(&agent.conversation_id).is_some(),
+            "stopping a user's sessions must keep the member conversation"
+        );
+    }
+}
+
+#[tokio::test]
 async fn ss3_stop_session_without_active_is_noop() {
     let svc = setup();
     let created = svc
@@ -7756,6 +7838,139 @@ async fn team_ask_modes_survive_member_runtime_rebuilds() {
         Some("read-only"),
         "the teammate must keep its ask-first seed when its runtime attaches"
     );
+}
+
+fn helper_request(name: &str, backend: &str) -> AddAgentRequest {
+    AddAgentRequest {
+        name: name.into(),
+        role: "teammate".into(),
+        backend: Some(backend.into()),
+        model: backend.into(),
+        assistant_id: None,
+    }
+}
+
+fn claude_lead_codex_grok_input() -> Vec<TeamAgentInput> {
+    let mut agents = claude_lead_codex_teammate_input();
+    // Grok runs as a custom ACP agent: backend `acp`, no catalog row.
+    agents.push(TeamAgentInput {
+        name: "Grok".into(),
+        role: "teammate".into(),
+        backend: Some("acp".into()),
+        model: "grok".into(),
+        assistant_id: None,
+        conversation_id: None,
+    });
+    agents
+}
+
+#[tokio::test]
+async fn team_ask_mode_reaches_every_member_and_helpers_added_mid_job() {
+    let (svc, _tm, conv_repo) =
+        setup_with_factory_and_metadata_and_conversation_repo(success_factory(), ask_mode_metadata_repo());
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                allowed_assistant_ids: None,
+                name: "Ask first mixed".into(),
+                agents: claude_lead_codex_grok_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    let by_name = |name: &str| {
+        created
+            .assistants
+            .iter()
+            .find(|a| a.name == name)
+            .unwrap_or_else(|| panic!("member {name}"))
+            .clone()
+    };
+    let (lead, codex) = (by_name("Lead"), by_name("Worker"));
+
+    svc.set_session_mode("user1", &created.id, "ask").await.unwrap();
+    assert_eq!(
+        session_mode_seed(&conv_repo, &lead.conversation_id).as_deref(),
+        Some("default")
+    );
+    assert_eq!(
+        session_mode_seed(&conv_repo, &codex.conversation_id).as_deref(),
+        Some("read-only")
+    );
+
+    // The session starts and the lead is rebuilt: still asks.
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    assert_eq!(
+        session_mode_seed(&conv_repo, &lead.conversation_id).as_deref(),
+        Some("default"),
+        "the lead must keep its ask mode when its runtime starts"
+    );
+
+    // Helpers of every backend added mid-job start in their ask mode.
+    let claude_helper = svc
+        .add_agent("user1", &created.id, helper_request("Claude helper", "claude"))
+        .await
+        .unwrap();
+    let codex_helper = svc
+        .add_agent("user1", &created.id, helper_request("Codex helper", "codex"))
+        .await
+        .unwrap();
+    let grok_helper = svc
+        .add_agent("user1", &created.id, helper_request("Grok helper", "acp"))
+        .await
+        .unwrap();
+    assert_eq!(
+        session_mode_seed(&conv_repo, &claude_helper.conversation_id).as_deref(),
+        Some("default")
+    );
+    assert_eq!(
+        session_mode_seed(&conv_repo, &codex_helper.conversation_id).as_deref(),
+        Some("read-only")
+    );
+    assert_eq!(
+        session_mode_seed(&conv_repo, &grok_helper.conversation_id),
+        None,
+        "a backend with no ask mode starts in its own default, never a minted full-auto seed"
+    );
+}
+
+#[tokio::test]
+async fn helper_added_after_per_backend_native_ask_ids_does_not_start_in_full_auto() {
+    // The leak: the old plugin sent one native ask id per backend, so a mixed
+    // team stored the last one (`read-only`), which Claude does not advertise.
+    let (svc, _tm, conv_repo) =
+        setup_with_factory_and_metadata_and_conversation_repo(success_factory(), ask_mode_metadata_repo());
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                allowed_assistant_ids: None,
+                name: "Native ids".into(),
+                agents: claude_lead_codex_grok_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    svc.set_session_mode("user1", &created.id, "default").await.unwrap();
+    svc.set_session_mode("user1", &created.id, "read-only").await.unwrap();
+
+    let claude_helper = svc
+        .add_agent("user1", &created.id, helper_request("Claude helper", "claude"))
+        .await
+        .unwrap();
+    let grok_helper = svc
+        .add_agent("user1", &created.id, helper_request("Grok helper", "acp"))
+        .await
+        .unwrap();
+    assert_eq!(
+        session_mode_seed(&conv_repo, &claude_helper.conversation_id).as_deref(),
+        Some("default"),
+        "a Claude helper must fall back to its ask mode, not bypassPermissions"
+    );
+    assert_eq!(session_mode_seed(&conv_repo, &grok_helper.conversation_id), None);
 }
 
 #[tokio::test]

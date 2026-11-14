@@ -657,10 +657,10 @@ impl TeamAgentProvisioner {
 
     /// The session-mode seed a member runtime is rebuilt with.
     ///
-    /// The Team row stores the owner's semantic choice (`full_auto` or a native
-    /// mode id); it is translated for this member exactly as for a new member:
-    /// `full_auto` becomes the member's own full-auto id, and a native id is
-    /// used only when this member advertises it. When the member does not
+    /// The Team row stores the owner's semantic choice (`full_auto`, `ask` or a
+    /// native mode id); it is translated for this member exactly as for a new
+    /// member: `full_auto` becomes the member's own full-auto id, `ask` its ask
+    /// mode, and a native id is used only when this member advertises it. When the member does not
     /// advertise the Team's native id, `None` is returned so the member keeps
     /// the seed `set_session_mode` (or creation) already persisted for it —
     /// that is how a mixed team keeps one ask-first id per backend.
@@ -930,8 +930,13 @@ impl TeamAgentProvisioner {
             "slot_id": slot_id,
             "role": role.to_string(),
             "backend": backend,
-            "session_mode": session_mode,
         });
+        // No seed when the member has no mode for the Team's choice: the
+        // backend then starts in its own default mode (never full-auto minted
+        // here).
+        if let Some(session_mode) = session_mode {
+            extra["session_mode"] = serde_json::Value::String(session_mode);
+        }
         if agent_type != AgentType::Aionrs {
             extra["current_model_id"] = serde_json::Value::String(model.to_owned());
         }

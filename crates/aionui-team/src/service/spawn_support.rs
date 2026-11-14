@@ -11,6 +11,9 @@ use crate::provisioning::PersistSpawnedAgentRequest;
 
 const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
 pub(crate) const TEAM_FULL_AUTO_MODE: &str = "full_auto";
+/// Semantic Team value: every member, the lead included, asks before acting.
+/// Each member maps it to its own ask mode through `ask_mode_for_backend`.
+pub(crate) const TEAM_ASK_MODE: &str = "ask";
 
 pub(crate) fn parse_agent_type(backend: &str) -> Result<AgentType, TeamError> {
     let quoted = format!("\"{backend}\"");
@@ -83,6 +86,43 @@ pub(crate) fn is_team_full_auto_mode(mode: &str) -> bool {
     mode.trim().eq_ignore_ascii_case(TEAM_FULL_AUTO_MODE)
 }
 
+pub(crate) fn is_team_ask_mode(mode: &str) -> bool {
+    mode.trim().eq_ignore_ascii_case(TEAM_ASK_MODE)
+}
+
+/// Whether `mode` is one of the semantic Team values (`full_auto`, `ask`)
+/// that every member translates into its own native id.
+pub(crate) fn is_team_semantic_mode(mode: &str) -> bool {
+    is_team_full_auto_mode(mode) || is_team_ask_mode(mode)
+}
+
+/// The native "ask before acting" mode for a backend, or `None` when the
+/// backend has no known ask mode (the member then keeps the backend's own
+/// start-up default, which is never minted here).
+///
+/// Sources:
+/// - claude: `default` is the non-bypass Claude Code permission mode; a live
+///   Team lead launched with it asked before writing
+///   (`~/AI/hub/reports/aioncore-fixes.md`, part B1).
+/// - codex: `read-only`; a live Codex member asked, deny left no file and
+///   approve wrote it (`~/AI/hub/reports/aioncore-fixes/evidence/pending-1-codex-deny.jsonl`,
+///   `pending-2-codex-approve.jsonl`). Codex's `default` alias maps to `auto`,
+///   not to an ask mode (`crates/aionui-ai-agent/src/manager/acp/mode_normalize.rs`).
+/// - antigravity: every agy mode, `default` included, asks for commands
+///   unless the full-auto sentinel is set (`crates/aionui-common/src/enums.rs`,
+///   `full_auto_mode_id`).
+///
+/// Custom ACP agents (backend `acp`) and the other CLI backends have no
+/// verified ask id yet, so they are deliberately absent.
+pub(crate) fn ask_mode_for_backend(backend: &str, agent_type: AgentType) -> Option<&'static str> {
+    match (agent_type, backend) {
+        (AgentType::Acp, "claude") => Some("default"),
+        (AgentType::Acp, "codex") => Some("read-only"),
+        (AgentType::Antigravity, _) => Some("default"),
+        _ => None,
+    }
+}
+
 /// Normalize the lead's native full-auto id before storing a Team-wide choice.
 /// AionFork forwards its selected lead mode unchanged to the Team session-mode
 /// API (verified: `~/AionFork/packages/desktop/src/renderer/pages/team/hooks/TeamPermissionContext.tsx:40-48`
@@ -104,9 +144,12 @@ pub(crate) fn normalize_team_mode_from_lead(
 
 /// Resolve a Team-level mode into this member's native session-mode id.
 ///
-/// Team stores `full_auto` as a semantic choice, not as the lead backend's
-/// native id. A member's metadata maps that choice to its own full-auto id.
-/// Other native ids pass through only when the member advertises them.
+/// Team stores `full_auto` and `ask` as semantic choices, not as the lead
+/// backend's native id. `full_auto` maps to the member's own full-auto id and
+/// `ask` to its ask mode (`None` when the backend has none). Other native ids
+/// pass through only when the member advertises them.
+///
+/// A Team with no chosen mode keeps the upstream default: full-auto.
 pub(crate) fn team_mode_for_backend(
     team_mode: Option<&str>,
     backend: &str,
@@ -117,21 +160,25 @@ pub(crate) fn team_mode_for_backend(
     match team_mode.map(str::trim).filter(|mode| !mode.is_empty()) {
         None => Some(default_mode()),
         Some(mode) if is_team_full_auto_mode(mode) => Some(default_mode()),
+        Some(mode) if is_team_ask_mode(mode) => ask_mode_for_backend(backend, agent_type).map(str::to_owned),
         Some(mode) if metadata_advertises_mode(metadata, mode) => Some(mode.to_owned()),
         Some(_) => None,
     }
 }
 
-/// New Team members inherit the semantic Team setting. An unsupported native
-/// id is not inherited; it falls back to this member's full-auto mode instead.
+/// The seed a new Team member is created with. It inherits the Team setting;
+/// when the member cannot take it (an `ask` Team on a backend with no ask
+/// mode, or a native id this backend does not advertise) it falls back to
+/// the backend's ask mode, never to full-auto. `None` means no seed is
+/// written and the backend starts in its own default mode.
 pub(crate) fn inherited_team_mode_for_backend(
     team_mode: Option<&str>,
     backend: &str,
     agent_type: AgentType,
     metadata: Option<&AgentMetadataRow>,
-) -> String {
+) -> Option<String> {
     team_mode_for_backend(team_mode, backend, agent_type, metadata)
-        .unwrap_or_else(|| session_mode_for_backend(backend, agent_type, metadata))
+        .or_else(|| ask_mode_for_backend(backend, agent_type).map(str::to_owned))
 }
 
 /// Only selectable option values count; `current_value` may be stale after an invalid seed.
@@ -1097,6 +1144,68 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn team_ask_resolves_per_backend_for_a_mixed_claude_codex_grok_team() {
+        let codex = agent_metadata_row("codex", Some("agent-full-access"));
+        let claude = agent_metadata_row("claude", Some("bypassPermissions"));
+        // Grok runs as a custom ACP agent: backend `acp`, no catalog row.
+        for (backend, metadata, expected) in [
+            ("claude", Some(&claude), Some("default")),
+            ("codex", Some(&codex), Some("read-only")),
+            ("acp", None, None),
+        ] {
+            assert_eq!(
+                team_mode_for_backend(Some("ask"), backend, AgentType::Acp, metadata).as_deref(),
+                expected,
+                "attach seed for {backend}"
+            );
+            assert_eq!(
+                inherited_team_mode_for_backend(Some("ask"), backend, AgentType::Acp, metadata).as_deref(),
+                expected,
+                "new-member seed for {backend}"
+            );
+        }
+        let mut agy = agent_metadata_row("antigravity", Some("yolo"));
+        agy.agent_type = AgentType::Antigravity.serde_name().to_owned();
+        assert_eq!(
+            team_mode_for_backend(Some("ASK"), "antigravity", AgentType::Antigravity, Some(&agy)).as_deref(),
+            Some("default")
+        );
+    }
+
+    #[test]
+    fn a_native_ask_id_from_another_backend_never_inherits_full_auto() {
+        // The leak: a mixed team stored the last native ask id it was sent.
+        let codex = agent_metadata_row("codex", Some("agent-full-access"));
+        let claude = agent_metadata_row("claude", Some("bypassPermissions"));
+        assert_eq!(
+            inherited_team_mode_for_backend(Some("read-only"), "claude", AgentType::Acp, Some(&claude)).as_deref(),
+            Some("default")
+        );
+        assert_eq!(
+            inherited_team_mode_for_backend(Some("default"), "codex", AgentType::Acp, Some(&codex)).as_deref(),
+            Some("read-only")
+        );
+        assert_eq!(
+            inherited_team_mode_for_backend(Some("read-only"), "acp", AgentType::Acp, None),
+            None,
+            "a backend with no ask mode gets no seed rather than its full-auto id"
+        );
+    }
+
+    #[test]
+    fn team_without_a_mode_keeps_the_upstream_full_auto_default() {
+        let claude = agent_metadata_row("claude", Some("bypassPermissions"));
+        assert_eq!(
+            inherited_team_mode_for_backend(None, "claude", AgentType::Acp, Some(&claude)).as_deref(),
+            Some("bypassPermissions")
+        );
+        assert_eq!(
+            inherited_team_mode_for_backend(None, "acp", AgentType::Acp, None).as_deref(),
+            Some("yolo")
+        );
+    }
+
+    #[test]
     fn lead_native_full_auto_ids_normalize_before_heterogeneous_propagation() {
         let codex = agent_metadata_row("codex", Some("agent-full-access"));
         let claude = agent_metadata_row("claude", Some("bypassPermissions"));
@@ -1144,8 +1253,9 @@ pub(crate) mod tests {
             None
         );
         assert_eq!(
-            inherited_team_mode_for_backend(Some("not-advertised"), "claude", AgentType::Acp, Some(&row)),
-            "bypassPermissions"
+            inherited_team_mode_for_backend(Some("not-advertised"), "claude", AgentType::Acp, Some(&row)).as_deref(),
+            Some("default"),
+            "an unsupported Team id must fall back to the member's ask mode, not full-auto"
         );
     }
 
@@ -1163,8 +1273,9 @@ pub(crate) mod tests {
             None
         );
         assert_eq!(
-            inherited_team_mode_for_backend(Some("stale-mode"), "claude", AgentType::Acp, Some(&row)),
-            "bypassPermissions"
+            inherited_team_mode_for_backend(Some("stale-mode"), "claude", AgentType::Acp, Some(&row)).as_deref(),
+            Some("default"),
+            "an unsupported Team id must fall back to the member's ask mode, not full-auto"
         );
     }
 
