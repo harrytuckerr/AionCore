@@ -1310,6 +1310,7 @@ mod tests {
                 },
             }],
             leader_assistant_id: Some("slot-1".into()),
+            allowed_assistant_ids: None,
             created_at: 1700000000000,
             updated_at: 1700001000000,
         };
@@ -1332,6 +1333,7 @@ mod tests {
             workspace: String::new(),
             assistants: vec![],
             leader_assistant_id: None,
+            allowed_assistant_ids: None,
             created_at: 1700000000000,
             updated_at: 1700000000000,
         };
@@ -1482,6 +1484,7 @@ mod tests {
                 },
             ],
             leader_assistant_id: Some("s1".into()),
+            allowed_assistant_ids: Some(vec!["x".into()]),
             created_at: 1000,
             updated_at: 2000,
         };
