@@ -363,6 +363,8 @@ impl BackendConnection for AntigravityConnection {
             pending: Arc::new(Mutex::new(HashMap::new())),
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
+            reader: std::sync::Mutex::new(None),
+            terminated: AtomicBool::new(false),
             in_flight: Arc::new(AtomicBool::new(false)),
             turn_started_hooked: Arc::new(AtomicBool::new(false)),
             deferred_mode_confirm: Arc::new(Mutex::new(None)),
@@ -443,6 +445,8 @@ pub struct AntigravitySessionBackend {
     /// this one ends. `dispatch` only has `&self` (trait signature), so the
     /// Arc cannot be threaded through the call.
     weak_self: std::sync::OnceLock<std::sync::Weak<Self>>,
+    reader: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
+    terminated: AtomicBool,
     /// Messages the user sent while a turn was running, in order.
     ///
     /// Each becomes its OWN next turn rather than being merged: merging would
@@ -768,6 +772,9 @@ impl AntigravitySessionBackend {
     }
 
     async fn start_turn(&self, content: Vec<ContentBlock>) -> Result<u64, BackendError> {
+        if self.terminated.load(Ordering::SeqCst) {
+            return Err(BackendError::Transport("Antigravity session has ended".into()));
+        }
         let turn_gen = self.turn_gen.fetch_add(1, Ordering::SeqCst) + 1;
         let input = ArgvInput {
             prompt: Self::prompt_text(&content),
@@ -811,7 +818,11 @@ impl AntigravitySessionBackend {
             .spawn(spec, &[], &self.session_id)
             .await
             .map_err(|e| BackendError::Transport(format!("spawn agy: {e}")))?;
-        *self.current.lock().await = Some(Arc::clone(&proc));
+        let mut current = self.current.lock().await;
+        if self.terminated.load(Ordering::SeqCst) {
+            return Err(BackendError::Transport("Antigravity session has ended".into()));
+        }
+        *current = Some(Arc::clone(&proc));
         // Freeze whether THIS turn can hear about a later mode switch. A hooked turn
         // calls back per tool use, so the host gate applies a switch at once; a full-auto
         // turn never calls back and only the next spawn can pick one up.
@@ -833,7 +844,7 @@ impl AntigravitySessionBackend {
         let anchor = Arc::clone(&self.anchor);
         let current = Arc::clone(&self.current);
 
-        tokio::spawn(async move {
+        let reader = tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, BufReader};
 
             let mut translator = Translator::default();
@@ -1031,6 +1042,25 @@ impl AntigravitySessionBackend {
                 tracing::error!(error = %e, "antigravity: queued message could not be started");
             }
         });
+        *self.reader.lock().unwrap_or_else(|e| e.into_inner()) = Some(reader.abort_handle());
+    }
+
+    async fn end_current_turn(&self) {
+        let process = self.current.lock().await.take();
+        if let Some(process) = process {
+            let _ = process.kill(std::time::Duration::from_secs(2)).await;
+        }
+        self.deny_all_pending().await;
+    }
+}
+
+impl Drop for AntigravitySessionBackend {
+    fn drop(&mut self) {
+        // Release the detached reader's process reference so the owning
+        // ManagedProcess can end and reap the child.
+        if let Some(reader) = self.reader.get_mut().unwrap_or_else(|e| e.into_inner()).take() {
+            reader.abort();
+        }
     }
 }
 
@@ -1039,6 +1069,9 @@ impl SessionBackend for AntigravitySessionBackend {
     async fn dispatch(&self, command: Command) -> Result<CommandReceipt, BackendError> {
         match command {
             Command::Send { content, .. } => {
+                if self.terminated.load(Ordering::SeqCst) {
+                    return Err(BackendError::Transport("Antigravity session has ended".into()));
+                }
                 if self.in_flight.load(Ordering::SeqCst) {
                     self.queued.lock().await.push_back(content);
                     return Ok(CommandReceipt {
@@ -1091,10 +1124,9 @@ impl SessionBackend for AntigravitySessionBackend {
                 if matches!(target, CancelTarget::Tool { .. }) {
                     return Err(BackendError::CommandNotSupported { command: "cancel_tool" });
                 }
-                self.terminate().await;
-                // The user asked to stop — running what they queued afterwards
-                // would be the opposite of what they meant.
+                // Cancel ends the turn without retiring the session.
                 self.queued.lock().await.clear();
+                self.end_current_turn().await;
                 Ok(CommandReceipt {
                     accepted: true,
                     admission: Admission::Started,
@@ -1230,11 +1262,9 @@ impl SessionBackend for AntigravitySessionBackend {
     }
 
     async fn terminate(&self) {
-        if let Some(proc) = self.current.lock().await.take() {
-            let _ = proc.kill(std::time::Duration::from_secs(2)).await;
-        }
-        // The process that would have consumed these answers is gone.
-        self.deny_all_pending().await;
+        self.terminated.store(true, Ordering::SeqCst);
+        self.queued.lock().await.clear();
+        self.end_current_turn().await;
     }
 
     async fn request_external_permission(&self, tool_name: String, input: serde_json::Value) -> PermissionDecision {
@@ -1469,6 +1499,8 @@ mod tests {
             pending: Arc::new(Mutex::new(HashMap::new())),
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
+            reader: std::sync::Mutex::new(None),
+            terminated: AtomicBool::new(false),
             in_flight: Arc::new(AtomicBool::new(false)),
             turn_started_hooked: Arc::new(AtomicBool::new(false)),
             deferred_mode_confirm: Arc::new(Mutex::new(None)),
@@ -1616,6 +1648,8 @@ mod tests {
             pending: Arc::new(Mutex::new(HashMap::new())),
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
+            reader: std::sync::Mutex::new(None),
+            terminated: AtomicBool::new(false),
             in_flight: Arc::new(AtomicBool::new(false)),
             turn_started_hooked: Arc::new(AtomicBool::new(false)),
             deferred_mode_confirm: Arc::new(Mutex::new(None)),
@@ -1984,6 +2018,8 @@ mod tests {
             pending: Arc::new(Mutex::new(HashMap::new())),
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
+            reader: std::sync::Mutex::new(None),
+            terminated: AtomicBool::new(false),
             in_flight: Arc::new(AtomicBool::new(false)),
             turn_started_hooked: Arc::new(AtomicBool::new(false)),
             deferred_mode_confirm: Arc::new(Mutex::new(None)),
@@ -2059,6 +2095,8 @@ mod tests {
             pending: Arc::new(Mutex::new(HashMap::new())),
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
+            reader: std::sync::Mutex::new(None),
+            terminated: AtomicBool::new(false),
             in_flight: Arc::new(AtomicBool::new(false)),
             turn_started_hooked: Arc::new(AtomicBool::new(false)),
             deferred_mode_confirm: Arc::new(Mutex::new(None)),
@@ -2205,6 +2243,8 @@ mod tests {
             pending: Arc::new(Mutex::new(HashMap::new())),
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
+            reader: std::sync::Mutex::new(None),
+            terminated: AtomicBool::new(false),
             in_flight: Arc::new(AtomicBool::new(false)),
             turn_started_hooked: Arc::new(AtomicBool::new(false)),
             deferred_mode_confirm: Arc::new(Mutex::new(None)),

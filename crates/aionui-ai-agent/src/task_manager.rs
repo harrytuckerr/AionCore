@@ -90,6 +90,65 @@ struct ManagedAgentTask {
 /// may retry; the slot itself is only removed on `kill` / `clear`.
 type TaskSlot = Arc<OnceCell<ManagedAgentTask>>;
 
+type Teardown = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+/// The teardown of a slot that has already been removed from the task map.
+///
+/// An initialised slot delegates to the agent's own awaitable kill. A slot whose
+/// build is still running waits for that build and then kills the result, so a
+/// removal during startup never orphans the process being started. A build that
+/// failed or never ran leaves nothing to kill.
+fn slot_teardown(id: String, slot: TaskSlot, reason: Option<AgentKillReason>) -> Teardown {
+    if let Some(managed) = slot.get() {
+        return managed.agent.kill_and_wait(reason);
+    }
+    Box::pin(async move {
+        match slot
+            .get_or_try_init(|| async { Err(AgentError::internal("task slot removed before initialization")) })
+            .await
+        {
+            Ok(managed) => {
+                info!(
+                    conversation_id = %id,
+                    ?reason,
+                    "Agent startup finished after teardown was requested; ending it"
+                );
+                managed.agent.clone().kill_and_wait(reason).await;
+            }
+            Err(error) => {
+                debug!(
+                    conversation_id = %id,
+                    ?reason,
+                    error = %ErrorChain(&error),
+                    "Kill requested for task slot that did not finish initialization"
+                );
+            }
+        }
+    })
+}
+
+/// Run `teardown` on its own task so that dropping the returned future (a
+/// caller's timeout, a cancelled request) cannot cancel it: the kill keeps going
+/// and the caller only decides how long to wait. Outside a runtime there is
+/// nothing to own the task, so the future is returned for the caller to drive.
+fn own_teardown(id: String, teardown: Teardown) -> Teardown {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            let task = handle.spawn(teardown);
+            Box::pin(async move {
+                if let Err(error) = task.await {
+                    warn!(conversation_id = %id, error = %error, "agent teardown task did not complete");
+                }
+            })
+        }
+        Err(_) => teardown,
+    }
+}
+
+fn slot_teardown_owned(id: String, slot: TaskSlot, reason: Option<AgentKillReason>) -> Teardown {
+    own_teardown(id.clone(), slot_teardown(id, slot, reason))
+}
+
 /// Default implementation of [`IWorkerTaskManager`] using a concurrent hash map.
 pub struct WorkerTaskManagerImpl {
     tasks: DashMap<String, TaskSlot>,
@@ -226,6 +285,11 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
             }
             if let Some(managed) = slot.get() {
                 managed.agent.kill(reason)?;
+            } else {
+                // Still starting: nothing to kill yet. Hand the slot to an owned
+                // task that kills the agent the moment its build finishes, so the
+                // removal above cannot orphan the process the build is starting.
+                drop(slot_teardown_owned(id, slot, reason));
             }
         }
         Ok(())
@@ -249,27 +313,10 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
             } else {
                 info!(conversation_id = %id, ?reason, "Killing agent task (awaitable)");
             }
-            if let Some(managed) = slot.get() {
-                return managed.agent.kill_and_wait(reason);
-            }
-            return Box::pin(async move {
-                match slot
-                    .get_or_try_init(|| async { Err(AgentError::internal("task slot removed before initialization")) })
-                    .await
-                {
-                    Ok(managed) => managed.agent.clone().kill_and_wait(reason).await,
-                    Err(error) => {
-                        debug!(
-                            conversation_id = %id,
-                            ?reason,
-                            error = %ErrorChain(&error),
-                            "Kill requested for task slot that did not finish initialization"
-                        );
-                    }
-                }
-            });
+            slot_teardown_owned(id, slot, reason)
+        } else {
+            Box::pin(std::future::ready(()))
         }
-        Box::pin(std::future::ready(()))
     }
 
     async fn clear(&self) {
@@ -279,9 +326,9 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
             if let Some((id, slot)) = self.tasks.remove(&key) {
                 self.invalidate_runtime_tokens(&id);
                 info!(conversation_id = %id, "Clearing agent task");
-                if let Some(managed) = slot.get() {
-                    waits.push(managed.agent.kill_and_wait(None));
-                }
+                // Slots still starting are included: they are killed as soon as
+                // their build finishes, instead of surviving the shutdown.
+                waits.push(slot_teardown_owned(id, slot, Some(AgentKillReason::EngineShutdown)));
             }
         }
         join_all(waits).await;
@@ -831,6 +878,151 @@ mod tests {
 
         assert_eq!(killed.load(Ordering::SeqCst), 1);
         assert_eq!(mgr.active_count(), 0);
+    }
+
+    /// A manager whose factory parks every build until released, and whose agents
+    /// count how often they are killed: the startup window a Team stop can land in.
+    struct GatedBuild {
+        mgr: Arc<WorkerTaskManagerImpl>,
+        build_started: Arc<tokio::sync::Notify>,
+        release_build: Arc<tokio::sync::Notify>,
+        killed: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    fn gated_build_manager() -> GatedBuild {
+        let build_started = Arc::new(tokio::sync::Notify::new());
+        let release_build = Arc::new(tokio::sync::Notify::new());
+        let killed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factory: AgentFactory = Arc::new({
+            let build_started = Arc::clone(&build_started);
+            let release_build = Arc::clone(&release_build);
+            let killed = Arc::clone(&killed);
+            move |opts: BuildTaskOptions| {
+                let build_started = Arc::clone(&build_started);
+                let release_build = Arc::clone(&release_build);
+                let killed = Arc::clone(&killed);
+                async move {
+                    build_started.notify_one();
+                    release_build.notified().await;
+                    Ok(mock_instance(
+                        MockAgent::new(opts.conversation_id(), None).with_kill_counter(killed),
+                    ))
+                }
+                .boxed()
+            }
+        });
+        GatedBuild {
+            mgr: Arc::new(WorkerTaskManagerImpl::new(factory)),
+            build_started,
+            release_build,
+            killed,
+        }
+    }
+
+    /// Wait (bounded) for the kill counter to reach `expected`.
+    async fn wait_for_kills(killed: &std::sync::atomic::AtomicUsize, expected: usize) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while killed.load(Ordering::SeqCst) != expected {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "expected {expected} kills, saw {}",
+                killed.load(Ordering::SeqCst)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// The stop path bounds how long it waits for a member (3s in the team
+    /// service) and then drops the wait. Dropping it must not cancel the kill: a
+    /// member whose startup outlasts the wait is still ended once it finishes
+    /// starting, instead of surviving as an unowned process.
+    #[tokio::test]
+    async fn dropping_the_wait_during_startup_does_not_orphan_the_agent() {
+        let gate = gated_build_manager();
+        let build = {
+            let mgr = Arc::clone(&gate.mgr);
+            tokio::spawn(async move { mgr.get_or_build_task("conv-1", make_options("conv-1")).await })
+        };
+        gate.build_started.notified().await;
+
+        let wait = gate.mgr.kill_and_wait("conv-1", Some(AgentKillReason::TeamStopped));
+        let timed_out = tokio::time::timeout(std::time::Duration::from_millis(20), wait).await;
+        assert!(
+            timed_out.is_err(),
+            "the wait must still be pending while the build is parked"
+        );
+        assert_eq!(gate.killed.load(Ordering::SeqCst), 0, "nothing exists to kill yet");
+
+        gate.release_build.notify_one();
+        build.await.unwrap().unwrap();
+
+        wait_for_kills(&gate.killed, 1).await;
+        assert_eq!(gate.mgr.active_count(), 0);
+    }
+
+    /// Never polling the returned future must not leave the startup unowned either:
+    /// ownership starts when `kill_and_wait` is called.
+    #[tokio::test]
+    async fn an_unpolled_kill_and_wait_still_ends_the_agent_after_startup() {
+        let gate = gated_build_manager();
+        let build = {
+            let mgr = Arc::clone(&gate.mgr);
+            tokio::spawn(async move { mgr.get_or_build_task("conv-1", make_options("conv-1")).await })
+        };
+        gate.build_started.notified().await;
+
+        drop(gate.mgr.kill_and_wait("conv-1", Some(AgentKillReason::TeamDeleted)));
+
+        gate.release_build.notify_one();
+        build.await.unwrap().unwrap();
+        wait_for_kills(&gate.killed, 1).await;
+    }
+
+    /// The synchronous `kill` used to do nothing for a slot still starting, so the
+    /// finished build was left running with no map entry.
+    #[tokio::test]
+    async fn sync_kill_during_startup_ends_the_agent_when_the_build_finishes() {
+        let gate = gated_build_manager();
+        let build = {
+            let mgr = Arc::clone(&gate.mgr);
+            tokio::spawn(async move { mgr.get_or_build_task("conv-1", make_options("conv-1")).await })
+        };
+        gate.build_started.notified().await;
+
+        gate.mgr
+            .kill("conv-1", Some(AgentKillReason::ConversationDeleted))
+            .unwrap();
+        assert_eq!(gate.mgr.active_count(), 0);
+
+        gate.release_build.notify_one();
+        build.await.unwrap().unwrap();
+        wait_for_kills(&gate.killed, 1).await;
+    }
+
+    /// Engine shutdown clears the manager: a build still in flight must not
+    /// survive it, and `clear` must wait for that member like any other.
+    #[tokio::test]
+    async fn clear_waits_for_and_ends_an_agent_that_is_still_starting() {
+        let gate = gated_build_manager();
+        let build = {
+            let mgr = Arc::clone(&gate.mgr);
+            tokio::spawn(async move { mgr.get_or_build_task("conv-1", make_options("conv-1")).await })
+        };
+        gate.build_started.notified().await;
+
+        let clear = {
+            let mgr = Arc::clone(&gate.mgr);
+            tokio::spawn(async move { mgr.clear().await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!clear.is_finished(), "clear must wait for the in-flight build");
+
+        gate.release_build.notify_one();
+        build.await.unwrap().unwrap();
+        clear.await.unwrap();
+
+        assert_eq!(gate.killed.load(Ordering::SeqCst), 1);
+        assert_eq!(gate.mgr.active_count(), 0);
     }
 
     #[tokio::test]

@@ -122,6 +122,20 @@ struct SessionEntry {
     slow_monitor_handle: tokio::task::JoinHandle<()>,
 }
 
+/// How long a stop waits for each member's process to end before it reports the
+/// member and moves on. The teardown itself is not cancelled by this bound.
+const MEMBER_TEARDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Add the conversations of every member the live session still holds that the
+/// list does not already name.
+async fn merge_conversation_ids(into: &mut Vec<String>, session: &TeamSession) {
+    for agent in session.scheduler().list_agents().await {
+        if !into.contains(&agent.conversation_id) {
+            into.push(agent.conversation_id);
+        }
+    }
+}
+
 pub struct TeamIdleCleanupCoordinator {
     service: Arc<TeamSessionService>,
     active_leases: Arc<ActiveLeaseRegistry>,
@@ -928,21 +942,93 @@ impl TeamSessionService {
     /// Tear down a team's live runtime and every member agent process WITHOUT
     /// deleting any data. Shared by `remove_team` (which then drops the rows)
     /// and `stop_team_processes` (archive, which keeps them). Best-effort: a
-    /// stuck kill is bounded by a 3s timeout, mirroring the delete path.
+    /// member that has not ended within `MEMBER_TEARDOWN_WAIT` is logged and its
+    /// teardown carries on in the background (see `end_member_runtimes`).
     async fn stop_team_runtime_and_agents(&self, team_id: &str, team: &Team, reason: AgentKillReason) {
-        self.stop_session_unchecked(team_id);
+        let live = self.stop_session_unchecked(team_id);
+        let mut conversation_ids: Vec<String> = team.agents.iter().map(|a| a.conversation_id.clone()).collect();
+        if let Some(session) = live {
+            merge_conversation_ids(&mut conversation_ids, &session).await;
+        }
+        self.end_member_runtimes(team_id, conversation_ids, reason).await;
+    }
 
-        let kill_futures: Vec<_> = team
-            .agents
-            .iter()
-            .map(|agent| self.task_manager.kill_and_wait(&agent.conversation_id, Some(reason)))
+    /// End every listed member process and report the ones still running when
+    /// the wait ends.
+    ///
+    /// Each member gets its own `MEMBER_TEARDOWN_WAIT`, so one stuck member does
+    /// not shorten the others' wait. The wait is only a bound on the caller: the
+    /// task manager owns each teardown, so a member whose startup outlasts the
+    /// wait is still killed once it finishes starting (see
+    /// `WorkerTaskManagerImpl::kill_and_wait`). A timeout is logged at `warn`
+    /// with the members involved, never swallowed. Returns how many members were
+    /// still ending when the wait expired.
+    async fn end_member_runtimes(
+        &self,
+        team_id: &str,
+        conversation_ids: Vec<String>,
+        reason: AgentKillReason,
+    ) -> usize {
+        let waits = conversation_ids.iter().map(|conversation_id| {
+            let teardown = self.task_manager.kill_and_wait(conversation_id, Some(reason));
+            async move {
+                tokio::time::timeout(MEMBER_TEARDOWN_WAIT, teardown)
+                    .await
+                    .is_err()
+                    .then_some(conversation_id.as_str())
+            }
+        });
+        let still_ending: Vec<&str> = futures_util::future::join_all(waits)
+            .await
+            .into_iter()
+            .flatten()
             .collect();
+        if still_ending.is_empty() {
+            debug!(
+                team_id,
+                ?reason,
+                members = conversation_ids.len(),
+                "team member runtimes ended"
+            );
+        } else {
+            warn!(
+                team_id,
+                ?reason,
+                members = conversation_ids.len(),
+                still_ending = still_ending.len(),
+                conversation_ids = ?still_ending,
+                "team member teardown still running after the wait; it continues in the background"
+            );
+        }
+        still_ending.len()
+    }
 
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            futures_util::future::join_all(kill_futures),
-        )
-        .await;
+    /// The conversations a stop must end: the stored team's members plus any the
+    /// live session still holds. A team row that is gone or unreadable (deleted
+    /// while its session ran, a database error) does not leave members running:
+    /// the live session answers for them. With neither, the lookup error stands.
+    async fn stop_targets(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        live: Option<&Arc<TeamSession>>,
+    ) -> Result<Vec<String>, TeamError> {
+        let mut conversation_ids = Vec::new();
+        match self.load_owned_team(user_id, team_id).await {
+            Ok(team) => conversation_ids.extend(team.agents.iter().map(|a| a.conversation_id.clone())),
+            Err(err) => match live {
+                Some(_) => warn!(
+                    team_id,
+                    error = %err,
+                    "could not load the team record to end its members; using the live session's members"
+                ),
+                None => return Err(err),
+            },
+        }
+        if let Some(session) = live {
+            merge_conversation_ids(&mut conversation_ids, session).await;
+        }
+        Ok(conversation_ids)
     }
 
     /// Archive-time teardown: stop the team runtime and kill every member agent
@@ -2667,19 +2753,34 @@ impl TeamSessionService {
 
     /// Stop the team runtime and end every member CLI process.
     ///
-    /// Members are killed with the idle-reaper reason: the conversations and
-    /// their backend resume anchors are kept, so the next `ensure_session`
-    /// resumes them exactly as it does after an idle clean-up. Without the
-    /// kill, a stopped team left its member CLIs running, unobserved, until
-    /// the idle reaper found them.
+    /// Members are ended with `TeamStopped`: the conversations and their
+    /// backend resume anchors are kept, so the next `ensure_session` resumes
+    /// them, but unlike the idle reaper's reason this also ends a member that
+    /// is mid-turn or still starting. Without the kill, a stopped team left its
+    /// member CLIs running, unobserved, until the idle reaper found them.
     pub async fn stop_session(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
-        let team = self.load_owned_team(user_id, team_id).await?;
+        let membership_lock = self
+            .add_agent_locks
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _membership_guard = membership_lock.lock().await;
+        let owns_live_session = self
+            .sessions
+            .get(team_id)
+            .is_some_and(|entry| entry.session.user_id() == user_id);
+        // Close this generation before enumerating it. The membership lock also
+        // prevents a replacement session from publishing during teardown.
+        let live = owns_live_session
+            .then(|| self.stop_session_unchecked(team_id))
+            .flatten();
+        let conversation_ids = self.stop_targets(user_id, team_id, live.as_ref()).await?;
         info!(
             team_id,
-            member_count = team.agents.len(),
+            member_count = conversation_ids.len(),
             "stopping team session and member runtimes"
         );
-        self.stop_team_runtime_and_agents(team_id, &team, AgentKillReason::IdleTimeout)
+        self.end_member_runtimes(team_id, conversation_ids, AgentKillReason::TeamStopped)
             .await;
         Ok(())
     }
@@ -2688,37 +2789,40 @@ impl TeamSessionService {
     /// processes (session revocation). Every runtime is stopped before the
     /// first await so no team dispatches another turn while members are
     /// being killed. Members are killed with the revocation reason, the same
-    /// one the conversation service uses for the user's other runtimes.
+    /// one the conversation service uses for the user's other runtimes. A team
+    /// whose record cannot be loaded still has its live session's members ended.
     pub async fn stop_sessions_for_user(&self, user_id: &str) -> usize {
-        let team_ids: Vec<String> = self
+        let live: Vec<(String, Arc<TeamSession>)> = self
             .sessions
             .iter()
             .filter(|entry| entry.session.user_id() == user_id)
-            .map(|entry| entry.key().clone())
+            .map(|entry| (entry.key().clone(), Arc::clone(&entry.session)))
             .collect();
-        let stopped = team_ids.len();
-        for team_id in &team_ids {
+        let stopped = live.len();
+        for (team_id, _) in &live {
             self.stop_session_unchecked(team_id);
         }
-        for team_id in &team_ids {
-            match self.load_owned_team(user_id, team_id).await {
-                Ok(team) => {
-                    self.stop_team_runtime_and_agents(team_id, &team, AgentKillReason::SessionRevoked)
-                        .await;
-                }
+        for (team_id, session) in &live {
+            let conversation_ids = match self.stop_targets(user_id, team_id, Some(session)).await {
+                Ok(ids) => ids,
                 Err(err) => {
-                    warn!(team_id = %team_id, error = %err, "could not load team to end member runtimes");
+                    warn!(team_id = %team_id, error = %err, "could not resolve team members to end");
+                    continue;
                 }
-            }
+            };
+            self.end_member_runtimes(team_id, conversation_ids, AgentKillReason::SessionRevoked)
+                .await;
         }
         stopped
     }
 
-    fn stop_session_unchecked(&self, team_id: &str) {
-        if let Some((_, entry)) = self.sessions.remove(team_id) {
-            entry.slow_monitor_handle.abort();
-            entry.session.stop();
-        }
+    /// Drop the live session and stop its runtime. Returns the session so a
+    /// caller can still read its members.
+    fn stop_session_unchecked(&self, team_id: &str) -> Option<Arc<TeamSession>> {
+        let (_, entry) = self.sessions.remove(team_id)?;
+        entry.slow_monitor_handle.abort();
+        entry.session.stop();
+        Some(Arc::clone(&entry.session))
     }
 
     pub async fn cleanup_idle_team_runtime_tasks(

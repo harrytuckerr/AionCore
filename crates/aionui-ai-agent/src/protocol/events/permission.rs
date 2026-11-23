@@ -66,6 +66,17 @@ pub enum AcpPermissionOptionKind {
     RejectAlways,
 }
 
+impl AcpPermissionOptionKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AllowOnce => "allow_once",
+            Self::AllowAlways => "allow_always",
+            Self::RejectOnce => "reject_once",
+            Self::RejectAlways => "reject_always",
+        }
+    }
+}
+
 impl AcpPermissionEventData {
     pub fn as_confirmation(&self) -> Option<Confirmation> {
         match self {
@@ -128,7 +139,8 @@ impl AcpPermissionRequestData {
                 .map(|opt| ConfirmationOption {
                     label: opt.name.clone(),
                     value: Value::String(opt.option_id.clone()),
-                    params: None,
+                    // ACP option IDs are opaque to clients recovering a pending card.
+                    params: Some([("acpOptionKind".to_owned(), opt.kind.as_str().to_owned())].into()),
                 })
                 .collect(),
         }
@@ -174,6 +186,35 @@ mod to_confirmation_tests {
     fn description_keeps_a_real_description_string() {
         let conf = request(json!({ "description": "Write /tmp/a.txt" })).to_confirmation();
         assert_eq!(conf.description, "Write /tmp/a.txt");
+    }
+
+    #[test]
+    fn confirmation_retains_option_kinds_alongside_opaque_ids() {
+        let mut req = request(json!({}));
+        req.options = [
+            ("first", AcpPermissionOptionKind::AllowOnce),
+            ("second", AcpPermissionOptionKind::AllowAlways),
+            ("third", AcpPermissionOptionKind::RejectOnce),
+            ("fourth", AcpPermissionOptionKind::RejectAlways),
+        ]
+        .into_iter()
+        .map(|(id, kind)| AcpPermissionOptionData {
+            option_id: id.into(),
+            name: id.into(),
+            kind,
+            meta: None,
+        })
+        .collect();
+
+        let options = req.to_confirmation().options;
+        assert_eq!(options.len(), req.options.len());
+        for (option, original) in options.iter().zip(&req.options) {
+            assert_eq!(option.value, json!(original.option_id));
+            assert_eq!(
+                json!(option.params.as_ref().unwrap()["acpOptionKind"]),
+                json!(original.kind)
+            );
+        }
     }
 
     /// Recovery source for the question text: `Confirmation` has no raw_input

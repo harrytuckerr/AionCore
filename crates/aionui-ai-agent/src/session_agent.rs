@@ -1437,11 +1437,11 @@ impl IAgentTask for SessionAgentTask {
         // time (ELECTRON-3RW). So we (1) emit a clean `Finish` FIRST to converge the
         // turn (gate recovers in seconds, no crash card), then (2) delegate real
         // process teardown to the backend, which kills the process tree WITHOUT
-        // waiting for the last Arc to drop.
-        if matches!(
-            reason,
-            Some(AgentKillReason::UserCancelTimeout | AgentKillReason::RuntimeRestart)
-        ) {
+        // waiting for the last Arc to drop. The same holds for every deliberate
+        // teardown (see `forces_backend_terminate`): a stopped, deleted, archived
+        // or revoked member must not outlive the call just because a turn holds an
+        // Arc.
+        if forces_backend_terminate(reason) {
             tracing::info!(
                 conversation_id = %self.conversation_id,
                 ?reason,
@@ -1453,12 +1453,24 @@ impl IAgentTask for SessionAgentTask {
             // 2) then real process teardown, fire-and-forget on this sync entry
             //    (the awaitable variant is `kill_and_wait`).
             let backend = self.backend.clone();
-            tokio::spawn(async move {
-                backend.terminate().await;
-            });
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    handle.spawn(async move {
+                        backend.terminate().await;
+                    });
+                }
+                // Reasons such as `ConversationDeleted` can reach this sync entry from
+                // a caller outside a runtime; Drop is then the only reaper left.
+                Err(_) => tracing::warn!(
+                    conversation_id = %self.conversation_id,
+                    ?reason,
+                    "session kill: no async runtime to terminate the backend; relying on Drop"
+                ),
+            }
             return Ok(());
         }
-        // Non-`UserCancelTimeout` (idle cleanup): unchanged Drop-driven teardown. The
+        // Idle cleanup and the recycle reasons (rebuild, capability change, error
+        // recovery): unchanged Drop-driven teardown. The
         // `SessionBackend` trait exposes no close/shutdown command; the sole reaper is
         // `Drop for ClaudeSessionBackend` / `CodexSessionBackend`, which aborts the
         // reader and `kill_on_drop`s the child once the last `Arc` is released. An idle
@@ -1468,23 +1480,45 @@ impl IAgentTask for SessionAgentTask {
     }
 }
 
+/// Kill reasons that must end the backend process immediately, even while an
+/// orchestrator still holds an `Arc<SessionAgentTask>` (so `Drop` cannot fire).
+///
+/// Two groups: the user-cancel force-kills, and the deliberate teardowns a
+/// Team stop, delete, archive, revocation or engine shutdown request. Idle
+/// cleanup (`IdleTimeout`, `None`) and the recycle reasons are deliberately
+/// absent: they keep the Drop-driven teardown.
+fn forces_backend_terminate(reason: Option<AgentKillReason>) -> bool {
+    matches!(
+        reason,
+        Some(
+            AgentKillReason::UserCancelTimeout
+                | AgentKillReason::RuntimeRestart
+                | AgentKillReason::TeamStopped
+                | AgentKillReason::TeamDeleted
+                | AgentKillReason::ConversationDeleted
+                | AgentKillReason::SessionRevoked
+                | AgentKillReason::Archived
+                | AgentKillReason::EngineShutdown
+        )
+    )
+}
+
 impl SessionAgentTask {
     /// Awaitable force-kill (aligns with `AcpAgentManager::kill_and_wait`): the
-    /// awaitable teardown entry the `UserCancel` watchdog uses. For a
-    /// `UserCancelTimeout` kill it emits the clean `Finish` synchronously FIRST
-    /// (so the gate recovers before the returned future is even polled), then
-    /// returns a future that awaits the backend's real process teardown. Any
-    /// other reason keeps the pre-existing Drop-driven semantics (nothing to
-    /// await). The strict order — clean converge, THEN terminate — is what keeps
-    /// the kill from surfacing as a crash (see `SuspendController::terminate`).
+    /// awaitable teardown entry the `UserCancel` watchdog and the Team stop,
+    /// delete, revocation and shutdown paths use. For a reason in
+    /// `forces_backend_terminate` it emits the clean `Finish` synchronously
+    /// FIRST (so the gate recovers before the returned future is even polled),
+    /// then returns a future that awaits the backend's real process teardown.
+    /// Any other reason keeps the pre-existing Drop-driven semantics (nothing
+    /// to await). The strict order — clean converge, THEN terminate — is what
+    /// keeps the kill from surfacing as a crash (see
+    /// `SuspendController::terminate`).
     pub fn kill_and_wait(
         &self,
         reason: Option<AgentKillReason>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        if matches!(
-            reason,
-            Some(AgentKillReason::UserCancelTimeout | AgentKillReason::RuntimeRestart)
-        ) {
+        if forces_backend_terminate(reason) {
             tracing::info!(
                 conversation_id = %self.conversation_id,
                 ?reason,
@@ -10406,6 +10440,177 @@ mod force_kill_tests {
             "non-UserCancel kill must not broadcast Finish/Error, got {terminal:?}"
         );
         assert_eq!(IAgentTask::status(task.as_ref()), Some(ConversationStatus::Running));
+    }
+
+    /// Team stop, delete, archive, revocation, conversation delete and engine
+    /// shutdown are deliberate teardowns: each ends the backend with a clean
+    /// `Finish` even while an orchestrator still holds the task `Arc`.
+    #[tokio::test]
+    async fn deliberate_teardown_reasons_terminate_backend_with_external_arc() {
+        for reason in [
+            AgentKillReason::TeamStopped,
+            AgentKillReason::TeamDeleted,
+            AgentKillReason::ConversationDeleted,
+            AgentKillReason::SessionRevoked,
+            AgentKillReason::Archived,
+            AgentKillReason::EngineShutdown,
+        ] {
+            let (task, counter) = build_task_with_counter();
+            let mut rx = IAgentTask::subscribe(task.as_ref());
+            start_turn(task.as_ref()).await;
+            let orchestrator_hold = Arc::clone(&task);
+
+            let inst = AgentInstance::Session(Arc::clone(&task));
+            inst.kill_and_wait(Some(reason)).await;
+
+            let terminal = next_terminal(&mut rx).await.expect("a terminal frame after the kill");
+            assert!(
+                matches!(terminal, AgentStreamEvent::Finish(_)),
+                "{reason:?} must finish the turn cleanly, got {terminal:?}"
+            );
+            assert_eq!(IAgentTask::status(task.as_ref()), Some(ConversationStatus::Finished));
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                1,
+                "{reason:?} must terminate the backend exactly once"
+            );
+            assert!(Arc::strong_count(&task) >= 2, "the orchestrator still holds the Arc");
+            drop(orchestrator_hold);
+        }
+    }
+
+    /// The synchronous kill entry reaches the backend too.
+    #[tokio::test]
+    async fn sync_kill_with_a_deliberate_reason_terminates_the_backend() {
+        let (task, counter) = build_task_with_counter();
+        let mut rx = IAgentTask::subscribe(task.as_ref());
+        start_turn(task.as_ref()).await;
+        let _orchestrator_hold = Arc::clone(&task);
+
+        IAgentTask::kill(task.as_ref(), Some(AgentKillReason::TeamStopped)).unwrap();
+
+        let terminal = next_terminal(&mut rx).await.expect("a terminal frame after the kill");
+        assert!(matches!(terminal, AgentStreamEvent::Finish(_)), "got {terminal:?}");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while counter.load(Ordering::SeqCst) == 0 {
+            assert!(tokio::time::Instant::now() < deadline, "backend.terminate never ran");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    /// The recycle reasons keep the Drop-driven teardown: they replace the task
+    /// rather than end the conversation's process on purpose.
+    #[tokio::test]
+    async fn recycle_reasons_keep_drop_driven_teardown() {
+        for reason in [
+            AgentKillReason::AgentErrorRecovery,
+            AgentKillReason::TeamMcpRebuild,
+            AgentKillReason::TeamContextReset,
+            AgentKillReason::RuntimeCapabilityChanged,
+        ] {
+            let (task, counter) = build_task_with_counter();
+            let mut rx = IAgentTask::subscribe(task.as_ref());
+            start_turn(task.as_ref()).await;
+
+            let inst = AgentInstance::Session(Arc::clone(&task));
+            inst.kill_and_wait(Some(reason)).await;
+
+            assert_eq!(counter.load(Ordering::SeqCst), 0, "{reason:?} must not force terminate");
+            assert!(
+                next_terminal(&mut rx).await.is_none(),
+                "{reason:?} must not finish the turn"
+            );
+        }
+    }
+
+    /// A backend that owns one real, benign child process (`sleep`) and ends it in
+    /// `terminate`, the way the claude, codex and antigravity backends end theirs.
+    #[cfg(unix)]
+    struct OwnedChildBackend {
+        child: Arc<aionui_process::ManagedProcess>,
+    }
+
+    #[cfg(unix)]
+    #[async_trait::async_trait]
+    impl SessionBackend for OwnedChildBackend {
+        async fn dispatch(&self, c: Command) -> Result<CommandReceipt, BackendError> {
+            let admission = match c {
+                Command::Send { .. } => Admission::Started,
+                _ => Admission::NoTurn,
+            };
+            Ok(CommandReceipt {
+                accepted: true,
+                admission,
+                turn_gen: 1,
+            })
+        }
+        fn events(&self) -> BoxStream<'static, SessionEnvelope> {
+            use futures_util::StreamExt as _;
+            futures_util::stream::pending().boxed()
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+        async fn terminate(&self) {
+            let _ = self.child.kill(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn spawn_sleeping_child() -> Arc<aionui_process::ManagedProcess> {
+        let spec = aionui_common::CommandSpec {
+            command: std::path::PathBuf::from("/bin/sleep"),
+            args: vec!["300".to_owned()],
+            env: Vec::new(),
+            cwd: None,
+        };
+        let child = aionui_process::ManagedProcess::spawn(spec, &[])
+            .await
+            .expect("spawn the benign test child");
+        assert!(!child.has_exited(), "the test child must be running before the kill");
+        Arc::new(child)
+    }
+
+    /// Regression for the Team stop leak: with a turn in flight (the orchestrator
+    /// holds the task `Arc`, so `Drop` cannot fire) a stop used to leave the
+    /// member's process running. A real child process must now be gone after the
+    /// kill returns, and an idle kill must still leave it to `Drop`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn team_stop_ends_a_real_owned_child_while_the_turn_holds_the_task() {
+        let child = spawn_sleeping_child().await;
+        let backend: Arc<dyn SessionBackend> = Arc::new(OwnedChildBackend {
+            child: Arc::clone(&child),
+        });
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend,
+            None,
+        );
+        start_turn(task.as_ref()).await;
+        let orchestrator_hold = Arc::clone(&task);
+
+        // Control: an idle kill keeps the Drop-driven behaviour, so the child lives on.
+        let inst = AgentInstance::Session(Arc::clone(&task));
+        inst.kill_and_wait(Some(AgentKillReason::IdleTimeout)).await;
+        assert!(
+            !child.has_exited(),
+            "an idle kill must not end the child while the Arc is held"
+        );
+
+        inst.kill_and_wait(Some(AgentKillReason::TeamStopped)).await;
+        let exited = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait_for_exit()).await;
+        assert!(exited.is_ok(), "the member's process must exit after a team stop");
+        assert!(child.has_exited());
+        assert!(
+            Arc::strong_count(&task) >= 2,
+            "the orchestrator still held the Arc throughout"
+        );
+        drop(orchestrator_hold);
     }
 }
 

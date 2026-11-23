@@ -340,6 +340,7 @@ pub(crate) async fn run_server(
     );
     let conversation_runtime_state = services.conversation_runtime_state.clone();
     let worker_task_manager = services.worker_task_manager.clone();
+    let team_service = router_runtime.team_service.clone();
     let client_pref_service = router_runtime.client_pref_service.clone();
 
     // All initialization is complete and we are about to begin serving. Emit the
@@ -396,6 +397,8 @@ pub(crate) async fn run_server(
                         reason = "graceful_shutdown",
                         active_turn_count, "conversation runtime shutdown prepared"
                     );
+                    // Stop team admission before waiting for the shared member task manager.
+                    team_service.dispose_all();
                     let active_task_count = worker_task_manager.active_count();
                     match tokio::time::timeout(WORKER_TASK_SHUTDOWN_TIMEOUT, worker_task_manager.clear()).await {
                         Ok(()) => info!(

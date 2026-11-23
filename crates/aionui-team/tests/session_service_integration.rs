@@ -1326,6 +1326,9 @@ struct TaskManagerCalls {
 struct CountingTaskManager {
     inner: WorkerTaskManagerImpl,
     calls: Mutex<TaskManagerCalls>,
+    /// Conversations whose `kill_and_wait` wait never resolves, while the real
+    /// teardown still runs: a member whose process takes longer than the stop's wait.
+    stuck_waits: Mutex<std::collections::HashSet<String>>,
 }
 
 impl CountingTaskManager {
@@ -1333,7 +1336,12 @@ impl CountingTaskManager {
         Self {
             inner: WorkerTaskManagerImpl::new(factory),
             calls: Mutex::new(TaskManagerCalls::default()),
+            stuck_waits: Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    fn stick_wait(&self, conversation_id: &str) {
+        self.stuck_waits.lock().unwrap().insert(conversation_id.to_owned());
     }
 
     async fn reset(&self) {
@@ -1387,7 +1395,13 @@ impl IWorkerTaskManager for CountingTaskManager {
             .unwrap()
             .kill
             .push((conversation_id.to_owned(), reason));
-        self.inner.kill_and_wait(conversation_id, reason)
+        let teardown = self.inner.kill_and_wait(conversation_id, reason);
+        if self.stuck_waits.lock().unwrap().contains(conversation_id) {
+            // The manager owns the teardown task, so dropping the wait leaves it running.
+            drop(teardown);
+            return Box::pin(std::future::pending());
+        }
+        teardown
     }
     async fn clear(&self) {
         self.inner.clear().await
@@ -7207,8 +7221,8 @@ async fn ss2_stop_session_ends_member_processes_but_keeps_conversations() {
             calls
                 .kill
                 .iter()
-                .any(|(id, reason)| id == &agent.conversation_id && *reason == Some(AgentKillReason::IdleTimeout)),
-            "stop_session must end member {} with the resumable idle reason: {:?}",
+                .any(|(id, reason)| id == &agent.conversation_id && *reason == Some(AgentKillReason::TeamStopped)),
+            "stop_session must end member {} with the team-stopped reason: {:?}",
             agent.slot_id,
             calls.kill
         );
@@ -7258,6 +7272,135 @@ async fn ss2b_stop_sessions_for_user_ends_member_processes() {
             "stopping a user's sessions must keep the member conversation"
         );
     }
+}
+
+#[tokio::test]
+async fn ss2c_stop_session_ends_members_when_the_team_record_is_gone() {
+    let (svc, team_repo, tm, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                allowed_assistant_ids: None,
+                name: "Record gone".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    // The record disappears while its session still runs.
+    team_repo.delete_team("user1", &created.id).await.unwrap();
+    tm.reset_calls();
+
+    svc.stop_session("user1", &created.id).await.unwrap();
+
+    let calls = tm.snapshot();
+    for agent in &created.assistants {
+        assert!(
+            calls
+                .kill
+                .iter()
+                .any(|(id, reason)| id == &agent.conversation_id && *reason == Some(AgentKillReason::TeamStopped)),
+            "a live member must still be ended without its team record: {:?}",
+            calls.kill
+        );
+    }
+}
+
+#[tokio::test]
+async fn ss2d_stop_session_for_an_unknown_team_with_no_live_session_is_not_found() {
+    let svc = setup();
+
+    let err = svc.stop_session("user1", "no-such-team").await.unwrap_err();
+
+    assert!(matches!(err, TeamError::TeamNotFound(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn ss2e_stop_sessions_for_user_ends_members_when_the_team_record_is_gone() {
+    let (svc, team_repo, tm, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                allowed_assistant_ids: None,
+                name: "Revoked, record gone".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    team_repo.delete_team("user1", &created.id).await.unwrap();
+    tm.reset_calls();
+
+    assert_eq!(svc.stop_sessions_for_user("user1").await, 1);
+
+    let calls = tm.snapshot();
+    for agent in &created.assistants {
+        assert!(
+            calls
+                .kill
+                .iter()
+                .any(|(id, reason)| id == &agent.conversation_id && *reason == Some(AgentKillReason::SessionRevoked)),
+            "revocation must end a live member even when the team record cannot be loaded: {:?}",
+            calls.kill
+        );
+    }
+}
+
+/// One member whose teardown outlasts the wait must neither stall the stop for
+/// longer than the wait nor stop the other members being ended. Paused time makes
+/// the 3 second wait instant to run and exact to measure.
+#[tokio::test(start_paused = true)]
+async fn ss2f_a_member_that_is_slow_to_end_does_not_block_the_stop() {
+    let (svc, tm, _conv_repo) = setup_with_factory_and_metadata_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                allowed_assistant_ids: None,
+                name: "Slow member".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    let slow = created.assistants[0].conversation_id.clone();
+    tm.stick_wait(&slow);
+    tm.reset_calls();
+
+    let started = tokio::time::Instant::now();
+    svc.stop_session("user1", &created.id).await.unwrap();
+    let waited = started.elapsed();
+
+    assert!(
+        waited >= std::time::Duration::from_secs(3) && waited < std::time::Duration::from_secs(6),
+        "the stop waits once, concurrently, for the slow member: {waited:?}"
+    );
+    let calls = tm.snapshot();
+    for agent in &created.assistants {
+        assert!(
+            calls.kill.iter().any(|(id, _)| id == &agent.conversation_id),
+            "every member, the slow one included, is asked to end: {:?}",
+            calls.kill
+        );
+    }
+    assert_eq!(tm.active_count(), 0, "the slow member's teardown still ran");
 }
 
 #[tokio::test]

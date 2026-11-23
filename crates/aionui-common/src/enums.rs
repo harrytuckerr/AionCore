@@ -297,6 +297,14 @@ pub enum AgentKillReason {
     /// conversation row and history are preserved — unarchiving cold-starts a
     /// fresh agent.
     Archived,
+    /// The owner stopped a Team session. Every member process must end, but the
+    /// conversations and their backend resume anchors are kept so the next
+    /// session resumes them. Unlike `IdleTimeout` this is a deliberate stop, so
+    /// it also ends a member that is mid-turn or still starting.
+    TeamStopped,
+    /// The engine is shutting down. Every live agent process must end before
+    /// the process exits, including one still starting up.
+    EngineShutdown,
 }
 
 /// File change operation type.
